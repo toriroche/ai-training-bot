@@ -47,6 +47,7 @@ WATCHLIST = [
     "MSFT", "AAPL", "GOOGL", "AMZN", "META",
     "NVDA", "AMD", "TSLA", "CRM", "SHOP",
     "PLTR", "SOFI", "BAC", "F",
+    "AEM", "GLD",
 ]
 
 # =============================================
