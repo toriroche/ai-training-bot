@@ -2,6 +2,38 @@ import urllib.request
 import json
 import pandas as pd
 from datetime import datetime
+import os
+
+# Alpaca Paper Trading Connection
+ALPACA_KEY    = os.environ.get("ALPACA_API_KEY")
+ALPACA_SECRET = os.environ.get("ALPACA_SECRET_KEY")
+ALPACA_URL    = "https://paper-api.alpaca.markets"
+
+def alpaca_request(method, endpoint, data=None):
+    url = f"{ALPACA_URL}{endpoint}"
+    req = urllib.request.Request(url, method=method)
+    req.add_header("APCA-API-KEY-ID", ALPACA_KEY)
+    req.add_header("APCA-API-SECRET-KEY", ALPACA_SECRET)
+    req.add_header("Content-Type", "application/json")
+    if data:
+        req.data = json.dumps(data).encode()
+    with urllib.request.urlopen(req) as r:
+        return json.loads(r.read())
+
+def get_account():
+    return alpaca_request("GET", "/v2/account")
+
+def get_positions():
+    return alpaca_request("GET", "/v2/positions")
+
+def place_order(symbol, qty, side):
+    return alpaca_request("POST", "/v2/orders", {
+        "symbol":        symbol,
+        "qty":           qty,
+        "side":          side,
+        "type":          "market",
+        "time_in_force": "day"
+    })
 
 def get_stock(symbol):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=6mo"
@@ -24,64 +56,28 @@ def analyze(prices):
     return "HOLD"
 
 def run():
-    portfolio = {
-        "MSFT": {"balance": 33333, "shares": 0, "buy_price": 0, "wins": 0, "losses": 0},
-        "NVDA": {"balance": 33333, "shares": 0, "buy_price": 0, "wins": 0, "losses": 0},
-        "AMD":  {"balance": 33334, "shares": 0, "buy_price": 0, "wins": 0, "losses": 0},
-    }
-
     print(f"\n🤖 AI Trading Bot Report")
     print(f"📅 {datetime.now().strftime('%Y-%m-%d %I:%M %p')}")
     print("="*45)
 
-    total_profit = 0
+    # Get account info
+    try:
+        account = get_account()
+        print(f"💰 Portfolio Value: ${float(account['portfolio_value']):,.2f}")
+        print(f"💵 Cash Available:  ${float(account['cash']):,.2f}")
+    except Exception as e:
+        print(f"⚠️ Account error: {e}")
+        return
 
-    for symbol, data in portfolio.items():
+    # Get current positions
+    try:
+        positions = get_positions()
+        held = {p["symbol"]: p for p in positions}
+    except:
+        held = {}
+
+    stocks = ["MSFT", "NVDA", "AMD"]
+
+    for symbol in stocks:
+        print(f"\n📊 {symbol}")
         try:
-            prices = get_stock(symbol)
-            signal = analyze(prices)
-            price  = prices[-1]
-
-            print(f"\n📊 {symbol} @ ${price:.2f}")
-            print(f"   Signal: {signal}")
-
-            if signal == "BUY" and data["shares"] == 0:
-                shares = int(333 / price)
-                if shares > 0:
-                    data["shares"]    = shares
-                    data["buy_price"] = price
-                    data["balance"]  -= shares * price
-                    print(f"   📈 BOUGHT {shares} shares @ ${price:.2f}")
-
-            elif data["shares"] > 0:
-                gain = (price - data["buy_price"]) / data["buy_price"]
-                print(f"   📉 Holding {data['shares']} shares | Gain: {gain*100:+.2f}%")
-
-                if gain >= 0.04:
-                    profit = data["shares"] * (price - data["buy_price"])
-                    data["balance"] += data["shares"] * price
-                    data["wins"]    += 1
-                    total_profit    += profit
-                    print(f"   💰 SOLD — Profit: ${profit:.2f}")
-                    data["shares"]    = 0
-                    data["buy_price"] = 0
-
-                elif gain <= -0.02:
-                    loss = data["shares"] * (price - data["buy_price"])
-                    data["balance"] += data["shares"] * price
-                    data["losses"]  += 1
-                    total_profit    += loss
-                    print(f"   🛑 STOP LOSS — Loss: ${loss:.2f}")
-                    data["shares"]    = 0
-                    data["buy_price"] = 0
-
-        except Exception as e:
-            print(f"   ⚠️ Error: {e}")
-
-    print(f"\n{'='*45}")
-    print(f"💼 Portfolio Summary")
-    print(f"   Session profit: ${total_profit:+,.2f}")
-    print(f"   Time: {datetime.now().strftime('%I:%M %p')}")
-    print(f"{'='*45}\n")
-
-run()
