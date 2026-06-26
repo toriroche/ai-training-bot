@@ -1,0 +1,25 @@
+name: AI Trading Bot
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'  # Runs every 30 minutes forever
+  workflow_dispatch:          # Lets you run it manually too
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      
+      - name: Install libraries
+        run: pip install -r requirements.txt
+      
+      - name: Run the trading bot
+        run: python bot.py
