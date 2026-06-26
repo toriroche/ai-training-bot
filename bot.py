@@ -3,8 +3,6 @@ import json
 import pandas as pd
 from datetime import datetime
 import os
-import smtplib
-from email.mime.text import MIMEText
 
 # =============================================
 # ALPACA CONNECTION
@@ -46,17 +44,15 @@ def get_account():
 def get_positions():
     return alpaca_request("GET", "/v2/positions")
 
-def place_order(symbol, qty, side):
+def place_fractional_order(symbol, dollars, side):
+    # Buy/sell by dollar amount instead of share quantity
     return alpaca_request("POST", "/v2/orders", {
         "symbol":        symbol,
-        "qty":           qty,
+        "notional":      str(round(dollars, 2)),  # Dollar amount
         "side":          side,
         "type":          "market",
         "time_in_force": "day"
     })
-
-def get_orders():
-    return alpaca_request("GET", "/v2/orders?status=all&limit=10")
 
 # =============================================
 # MARKET DATA
@@ -96,7 +92,7 @@ def run():
 
     # Get account
     try:
-        account  = get_account()
+        account   = get_account()
         portfolio = float(account["portfolio_value"])
         cash      = float(account["cash"])
         report.append(f"💼 Portfolio Value: ${portfolio:,.2f}")
@@ -114,14 +110,17 @@ def run():
         report.append(f"⚠️ Positions error: {e}")
         held = {}
 
-    # Track session results
-    buys   = 0
-    sells  = 0
-    holds  = 0
-    errors = 0
+    # Budget per stock
+    budget_per_stock = round(WEEKLY_BUDGET / MAX_POSITIONS, 2)
+    report.append(f"📊 Per stock budget: ${budget_per_stock:.2f}")
+    report.append("="*45)
+
+    # Track session
+    buys     = 0
+    sells    = 0
+    holds    = 0
     total_pl = 0
 
-    # Check each stock
     for symbol in STOCKS:
         report.append(f"\n📊 {symbol}")
         try:
@@ -131,47 +130,44 @@ def run():
             report.append(f"   Price:  ${price:.2f}")
             report.append(f"   Signal: {signal}")
 
-            # BUY
+            # BUY — fractional by dollar amount
             if signal == "BUY" and symbol not in held:
-                budget_per_stock = WEEKLY_BUDGET / MAX_POSITIONS
-                qty = int(budget_per_stock / price)
-                if qty >= 1:
-                    place_order(symbol, qty, "buy")
-                    cost = qty * price
-                    report.append(f"   📈 BUY: {qty} shares @ ${price:.2f} = ${cost:.2f}")
+                if cash >= budget_per_stock:
+                    place_fractional_order(symbol, budget_per_stock, "buy")
+                    report.append(f"   📈 BUY: ${budget_per_stock:.2f} worth of {symbol}")
+                    report.append(f"   📈 Approx {budget_per_stock/price:.4f} shares @ ${price:.2f}")
                     buys += 1
                 else:
-                    report.append(f"   ⚠️ Budget ${budget_per_stock:.2f} too small for 1 share at ${price:.2f}")
-                    report.append(f"   💡 Increase WEEKLY_BUDGET to trade {symbol}")
+                    report.append(f"   ⚠️ Not enough cash available")
                     holds += 1
 
             # SELL — take profit or stop loss
             elif symbol in held:
-                qty        = int(float(held[symbol]["qty"]))
+                qty        = held[symbol]["qty"]
                 unrealized = float(held[symbol]["unrealized_pl"])
                 gain_pct   = float(held[symbol]["unrealized_plpc"])
                 total_pl  += unrealized
 
                 if gain_pct >= TAKE_PROFIT:
-                    place_order(symbol, qty, "sell")
-                    report.append(f"   💰 SELL (profit): {qty} shares | P&L: +${unrealized:.2f}")
+                    place_fractional_order(symbol, float(held[symbol]["market_value"]), "sell")
+                    report.append(f"   💰 SELL (take profit): P&L: +${unrealized:.2f} ({gain_pct*100:+.2f}%)")
                     sells += 1
                 elif gain_pct <= -STOP_LOSS:
-                    place_order(symbol, qty, "sell")
-                    report.append(f"   🛑 SELL (stop loss): {qty} shares | P&L: ${unrealized:.2f}")
+                    place_fractional_order(symbol, float(held[symbol]["market_value"]), "sell")
+                    report.append(f"   🛑 SELL (stop loss): P&L: ${unrealized:.2f} ({gain_pct*100:+.2f}%)")
                     sells += 1
                 else:
-                    report.append(f"   📦 Holding {qty} shares | P&L: ${unrealized:+.2f} ({gain_pct*100:+.2f}%)")
+                    report.append(f"   📦 Holding {qty} shares")
+                    report.append(f"   📦 P&L: ${unrealized:+.2f} ({gain_pct*100:+.2f}%)")
                     holds += 1
 
-            # HOLD — waiting
+            # HOLD
             else:
                 report.append(f"   ⏳ Waiting for BUY signal...")
                 holds += 1
 
         except Exception as e:
             report.append(f"   ⚠️ Error: {e}")
-            errors += 1
 
     # Summary
     report.append(f"\n{'='*45}")
@@ -181,13 +177,11 @@ def run():
     report.append(f"   Sells executed: {sells}")
     report.append(f"   Holding:        {holds}")
     report.append(f"   Open P&L:       ${total_pl:+.2f}")
-    report.append(f"   Errors:         {errors}")
     report.append(f"{'='*45}")
     report.append(f"✅ Bot cycle complete")
     report.append(f"⏰ Next run in 30 minutes")
     report.append(f"{'='*45}")
 
-    # Print full report
     print("\n".join(report))
 
 run()
