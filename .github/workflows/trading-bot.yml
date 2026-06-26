@@ -2,8 +2,8 @@ name: AI Trading Bot
 
 on:
   schedule:
-    - cron: '*/30 * * * *'  # Runs every 30 minutes forever
-  workflow_dispatch:          # Lets you run it manually too
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
 
 jobs:
   run-bot:
@@ -11,10 +11,10 @@ jobs:
     
     steps:
       - name: Get the code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
       
