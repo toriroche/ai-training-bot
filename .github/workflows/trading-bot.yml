@@ -22,4 +22,7 @@ jobs:
         run: pip install -r requirements.txt
       
       - name: Run the trading bot
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
         run: python bot.py
