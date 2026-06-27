@@ -6,6 +6,7 @@ import os
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from zoneinfo import ZoneInfo
 
 # =============================================
 # ALPACA CONNECTION
@@ -23,14 +24,11 @@ EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")
 # =============================================
 # WEEKLY TEST BUDGET — ONLY CHANGE THIS
 # =============================================
-WEEKLY_BUDGET  = 100     # Week 1: $100
-                         # Week 2: change to 1000
-                         # Week 3: change to 2000
-                         # Week 4: change to 3000
-
+WEEKLY_BUDGET  = 100
 STOP_LOSS      = 0.02
 TAKE_PROFIT    = 0.04
 MAX_POSITIONS  = 3
+MIN_ORDER      = 1.00
 
 # RSI Settings
 RSI_PERIOD     = 14
@@ -39,6 +37,9 @@ RSI_OVERSOLD   = 30
 
 # Volume Settings
 VOLUME_CONFIRM = 1.2
+
+# Timezone
+ET = ZoneInfo("America/New_York")
 
 # =============================================
 # WATCHLIST
@@ -49,6 +50,26 @@ WATCHLIST = [
     "PLTR", "SOFI", "BAC", "F",
     "AEM", "GLD",
 ]
+
+# =============================================
+# SAFETY RULE 1 — MARKET HOURS FILTER (ET)
+# =============================================
+def is_market_open():
+    now_et  = datetime.now(ET)
+    weekday = now_et.weekday()
+
+    if weekday >= 5:
+        return False, f"Market closed — {now_et.strftime('%A')} is a weekend"
+
+    market_open  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
+    market_close = now_et.replace(hour=16, minute=0,  second=0, microsecond=0)
+
+    if now_et < market_open:
+        return False, f"Market not open yet — opens 9:30am ET (now {now_et.strftime('%I:%M %p')} ET)"
+    if now_et > market_close:
+        return False, f"Market closed for the day — closed 4:00pm ET (now {now_et.strftime('%I:%M %p')} ET)"
+
+    return True, f"Market OPEN — {now_et.strftime('%I:%M %p')} ET"
 
 # =============================================
 # ALPACA API
@@ -70,7 +91,11 @@ def get_account():
 def get_positions():
     return alpaca_request("GET", "/v2/positions")
 
+# SAFETY RULE 3 — Minimum $1.00 notional
 def place_fractional_order(symbol, dollars, side):
+    if dollars < MIN_ORDER:
+        print(f"   ⚠️ {symbol}: ${dollars:.2f} below minimum ${MIN_ORDER:.2f} — skipping")
+        return None
     return alpaca_request("POST", "/v2/orders", {
         "symbol":        symbol,
         "notional":      str(round(dollars, 2)),
@@ -128,6 +153,7 @@ def get_volume_signal(volumes):
     ratio         = latest_volume / avg_volume if avg_volume > 0 else 1.0
     return ratio >= VOLUME_CONFIRM, round(ratio, 2)
 
+# SAFETY RULE 4 — News API Failsafe
 def get_news_sentiment(symbol):
     try:
         url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol}&region=US&lang=en-US"
@@ -198,21 +224,20 @@ def full_analysis(symbol):
 # =============================================
 def send_email(subject, report_lines):
     try:
-        body = "\n".join(report_lines)
-
-        msg = MIMEMultipart("alternative")
+        if not EMAIL_ADDRESS or not EMAIL_PASSWORD:
+            print("⚠️ Email credentials not set — skipping email")
+            return False
+        body     = "\n".join(report_lines)
+        msg      = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"]    = EMAIL_ADDRESS
         msg["To"]      = EMAIL_ADDRESS
-
-        # Plain text version
         text_part = MIMEText(body, "plain")
-
-        # HTML version — looks nice in Gmail
         html_body = f"""
         <html>
         <body style="font-family:monospace;background:#0a0a0a;color:#00ff00;padding:20px;">
-            <div style="max-width:600px;margin:0 auto;background:#111;padding:20px;border-radius:10px;border:1px solid #00ff00;">
+            <div style="max-width:600px;margin:0 auto;background:#111;padding:20px;
+                        border-radius:10px;border:1px solid #00ff00;">
                 <h2 style="color:#00ff00;">🤖 AI Trading Bot Report</h2>
                 <pre style="color:#00ff00;font-size:13px;line-height:1.6;">{body}</pre>
                 <hr style="border-color:#00ff00;">
@@ -223,35 +248,49 @@ def send_email(subject, report_lines):
             </div>
         </body>
         </html>"""
-
         html_part = MIMEText(html_body, "html")
         msg.attach(text_part)
         msg.attach(html_part)
-
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
             server.sendmail(EMAIL_ADDRESS, EMAIL_ADDRESS, msg.as_string())
-
-        print(f"📧 Email report sent to {EMAIL_ADDRESS}")
+        print(f"📧 Email sent to {EMAIL_ADDRESS}")
         return True
-
     except Exception as e:
         print(f"⚠️ Email failed: {e}")
         return False
 
 # =============================================
-# MAIN BOT
+# MAIN BOT — SAFETY RULE 2: Runs once, exits
 # =============================================
 def run():
+    now_et = datetime.now(ET)
     report = []
     report.append(f"🤖 AI Trading Bot Report")
-    report.append(f"📅 {datetime.now().strftime('%Y-%m-%d %I:%M %p')}")
+    report.append(f"📅 {now_et.strftime('%Y-%m-%d %I:%M %p')} ET")
     report.append(f"💰 Weekly Budget: ${WEEKLY_BUDGET:,}")
     report.append(f"👁 Watching {len(WATCHLIST)} stocks")
     report.append(f"🧠 MA + RSI + Volume + News")
     report.append("="*45)
 
+    # SAFETY RULE 1 — Market hours check using ET
+    market_open, market_msg = is_market_open()
+    report.append(f"🕐 {market_msg}")
+
+    if not market_open:
+        report.append(f"🛑 Bot exiting — market is closed")
+        report.append(f"{'='*45}")
+        print("\n".join(report))
+
+        # Still send email so you know bot ran
+        subject = f"🛑 Bot Report — {now_et.strftime('%B %d %I:%M %p')} ET — Market Closed"
+        send_email(subject, report)
+        return
+
+    report.append("="*45)
+
     # Get account
+    account = None
     try:
         account   = get_account()
         portfolio = float(account["portfolio_value"])
@@ -261,6 +300,7 @@ def run():
     except Exception as e:
         report.append(f"⚠️ Account error: {e}")
         print("\n".join(report))
+        send_email(f"⚠️ Bot Error — {now_et.strftime('%B %d %I:%M %p')} ET", report)
         return
 
     # Get positions
@@ -273,6 +313,7 @@ def run():
 
     budget_per_stock = round(WEEKLY_BUDGET / MAX_POSITIONS, 2)
     report.append(f"📊 Per position: ${budget_per_stock:.2f}")
+    report.append(f"🛡 Min order:    ${MIN_ORDER:.2f}")
     report.append("="*45)
 
     # Scan all stocks
@@ -283,7 +324,7 @@ def run():
 
     for symbol in WATCHLIST:
         try:
-            a = full_analysis(symbol)
+            a         = full_analysis(symbol)
             rsi_label = "oversold 🟢" if a["rsi"] < RSI_OVERSOLD else "overbought 🔴" if a["rsi"] > RSI_OVERBOUGHT else "normal ⚪"
             vol_label = "✅ confirmed" if a["volume"] >= VOLUME_CONFIRM else "⚠️ low"
             emoji     = "🟢" if a["signal"] == "BUY" else "🔴" if a["signal"] == "SELL" else "⏳"
@@ -310,11 +351,15 @@ def run():
             unrealized = float(pos["unrealized_pl"])
             gain_pct   = float(pos["unrealized_plpc"])
             if gain_pct >= TAKE_PROFIT:
-                place_fractional_order(symbol, float(pos["market_value"]), "sell")
-                report.append(f"   💰 TAKE PROFIT {symbol}: +${unrealized:.2f} ({gain_pct*100:+.2f}%)")
+                result = place_fractional_order(
+                    symbol, float(pos["market_value"]), "sell")
+                if result:
+                    report.append(f"   💰 TAKE PROFIT {symbol}: +${unrealized:.2f} ({gain_pct*100:+.2f}%)")
             elif gain_pct <= -STOP_LOSS:
-                place_fractional_order(symbol, float(pos["market_value"]), "sell")
-                report.append(f"   🛑 STOP LOSS {symbol}: ${unrealized:.2f} ({gain_pct*100:+.2f}%)")
+                result = place_fractional_order(
+                    symbol, float(pos["market_value"]), "sell")
+                if result:
+                    report.append(f"   🛑 STOP LOSS {symbol}: ${unrealized:.2f} ({gain_pct*100:+.2f}%)")
             else:
                 report.append(f"   📦 {symbol}: ${unrealized:+.2f} ({gain_pct*100:+.2f}%) — holding")
         except Exception as e:
@@ -328,9 +373,11 @@ def run():
     for symbol in sell_signals:
         if symbol in held:
             try:
-                place_fractional_order(symbol, float(held[symbol]["market_value"]), "sell")
-                report.append(f"   🔴 SOLD {symbol}")
-                sells += 1
+                result = place_fractional_order(
+                    symbol, float(held[symbol]["market_value"]), "sell")
+                if result:
+                    report.append(f"   🔴 SOLD {symbol}")
+                    sells += 1
             except Exception as e:
                 report.append(f"   ⚠️ {symbol}: {e}")
     if sells == 0:
@@ -350,12 +397,16 @@ def run():
         if cash < budget_per_stock:
             report.append(f"   ⚠️ Not enough cash for {symbol}")
             continue
+        if budget_per_stock < MIN_ORDER:
+            report.append(f"   ⚠️ ${budget_per_stock:.2f} below minimum — skipping {symbol}")
+            continue
         try:
-            place_fractional_order(symbol, budget_per_stock, "buy")
-            report.append(f"   📈 BOUGHT {symbol} @ ${signal['price']:.2f}")
-            report.append(f"   📈 ${budget_per_stock:.2f} | Score: {signal['score']}/100 | RSI: {signal['rsi']} | News: {signal['news']}")
-            cash -= budget_per_stock
-            buys += 1
+            result = place_fractional_order(symbol, budget_per_stock, "buy")
+            if result:
+                report.append(f"   📈 BOUGHT {symbol} @ ${signal['price']:.2f}")
+                report.append(f"   📈 ${budget_per_stock:.2f} | Score: {signal['score']}/100 | RSI: {signal['rsi']} | News: {signal['news']}")
+                cash -= budget_per_stock
+                buys += 1
         except Exception as e:
             report.append(f"   ⚠️ Buy error {symbol}: {e}")
     if buys == 0:
@@ -378,16 +429,11 @@ def run():
     # Print to GitHub logs
     print("\n".join(report))
 
-    # Send email report
-    now  = datetime.now()
-    hour = now.hour
+    # Send email every run so you never miss anything
+    portfolio_val = float(account["portfolio_value"]) if account else 0
+    profit        = portfolio_val - 100000
+    subject       = f"📊 Bot Report — {now_et.strftime('%b %d %I:%M %p')} ET | P&L: ${profit:+.2f} | Buys: {buys} Sells: {sells}"
+    send_email(subject, report)
 
-    # Only email at end of trading day (4pm EST = after market close)
-    # GitHub runs in UTC so 4pm EST = 21:00 UTC
-    if hour >= 21 or hour < 2:
-        subject = f"📊 Daily Trading Bot Report — {now.strftime('%B %d, %Y')} | P&L: ${float(account.get('equity', 100000)) - 100000:+.2f}"
-        send_email(subject, report)
-    else:
-        print(f"📧 Email sends at market close (4pm EST) — current hour: {hour} UTC")
-
+# SAFETY RULE 2 — Runs exactly once then exits
 run()
