@@ -227,8 +227,8 @@ def send_email(subject, report_lines):
         if not EMAIL_ADDRESS or not EMAIL_PASSWORD:
             print("⚠️ Email credentials not set — skipping email")
             return False
-        body     = "\n".join(report_lines)
-        msg      = MIMEMultipart("alternative")
+        body      = "\n".join(report_lines)
+        msg       = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"]    = EMAIL_ADDRESS
         msg["To"]      = EMAIL_ADDRESS
@@ -238,7 +238,7 @@ def send_email(subject, report_lines):
         <body style="font-family:monospace;background:#0a0a0a;color:#00ff00;padding:20px;">
             <div style="max-width:600px;margin:0 auto;background:#111;padding:20px;
                         border-radius:10px;border:1px solid #00ff00;">
-                <h2 style="color:#00ff00;">🤖 AI Trading Bot Report</h2>
+                <h2 style="color:#00ff00;">🤖 AI Trading Bot — Daily Report</h2>
                 <pre style="color:#00ff00;font-size:13px;line-height:1.6;">{body}</pre>
                 <hr style="border-color:#00ff00;">
                 <p style="color:#555;font-size:11px;">
@@ -254,26 +254,27 @@ def send_email(subject, report_lines):
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
             server.sendmail(EMAIL_ADDRESS, EMAIL_ADDRESS, msg.as_string())
-        print(f"📧 Email sent to {EMAIL_ADDRESS}")
+        print(f"📧 Daily report sent to {EMAIL_ADDRESS}")
         return True
     except Exception as e:
         print(f"⚠️ Email failed: {e}")
         return False
 
 # =============================================
-# MAIN BOT — SAFETY RULE 2: Runs once, exits
+# MAIN BOT — SAFETY RULE 2: Runs once exits
 # =============================================
 def run():
     now_et = datetime.now(ET)
     report = []
-    report.append(f"🤖 AI Trading Bot Report")
-    report.append(f"📅 {now_et.strftime('%Y-%m-%d %I:%M %p')} ET")
+    report.append(f"🤖 AI Trading Bot — Daily Report")
+    report.append(f"📅 {now_et.strftime('%A %B %d, %Y')}")
+    report.append(f"⏰ Generated: {now_et.strftime('%I:%M %p')} ET")
     report.append(f"💰 Weekly Budget: ${WEEKLY_BUDGET:,}")
     report.append(f"👁 Watching {len(WATCHLIST)} stocks")
     report.append(f"🧠 MA + RSI + Volume + News")
     report.append("="*45)
 
-    # SAFETY RULE 1 — Market hours check using ET
+    # SAFETY RULE 1 — Market hours check
     market_open, market_msg = is_market_open()
     report.append(f"🕐 {market_msg}")
 
@@ -281,26 +282,24 @@ def run():
         report.append(f"🛑 Bot exiting — market is closed")
         report.append(f"{'='*45}")
         print("\n".join(report))
-
-        # Still send email so you know bot ran
-        subject = f"🛑 Bot Report — {now_et.strftime('%B %d %I:%M %p')} ET — Market Closed"
-        send_email(subject, report)
         return
 
     report.append("="*45)
 
     # Get account
     account = None
+    profit  = 0
     try:
         account   = get_account()
         portfolio = float(account["portfolio_value"])
         cash      = float(account["cash"])
+        profit    = portfolio - 100000
         report.append(f"💼 Portfolio Value: ${portfolio:,.2f}")
         report.append(f"💵 Cash Available:  ${cash:,.2f}")
+        report.append(f"📈 Total P&L:       ${profit:+,.2f}")
     except Exception as e:
         report.append(f"⚠️ Account error: {e}")
         print("\n".join(report))
-        send_email(f"⚠️ Bot Error — {now_et.strftime('%B %d %I:%M %p')} ET", report)
         return
 
     # Get positions
@@ -312,11 +311,11 @@ def run():
         held = {}
 
     budget_per_stock = round(WEEKLY_BUDGET / MAX_POSITIONS, 2)
-    report.append(f"📊 Per position: ${budget_per_stock:.2f}")
-    report.append(f"🛡 Min order:    ${MIN_ORDER:.2f}")
+    report.append(f"📊 Per position:    ${budget_per_stock:.2f}")
+    report.append(f"🛡 Min order:       ${MIN_ORDER:.2f}")
     report.append("="*45)
 
-    # Scan all stocks
+    # Scan stocks
     report.append(f"\n🔍 SCANNING {len(WATCHLIST)} STOCKS...\n")
 
     buy_signals  = []
@@ -412,28 +411,30 @@ def run():
     if buys == 0:
         report.append(f"   — No strong BUY signals this cycle")
 
-    # Summary
+    # Final summary
     report.append(f"\n{'='*45}")
-    report.append(f"📊 SESSION SUMMARY")
+    report.append(f"📊 END OF DAY SUMMARY")
     report.append(f"{'='*45}")
     report.append(f"   Stocks monitored: {len(WATCHLIST)}")
     report.append(f"   BUY signals:      {len(buy_signals)}")
     report.append(f"   Buys executed:    {buys}")
     report.append(f"   Sells executed:   {sells}")
     report.append(f"   Positions held:   {len(held)}")
+    report.append(f"   Total P&L:        ${profit:+,.2f}")
     report.append(f"{'='*45}")
-    report.append(f"✅ Bot cycle complete")
-    report.append(f"⏰ Next run in 30 minutes")
+    report.append(f"✅ See you tomorrow!")
     report.append(f"{'='*45}")
 
     # Print to GitHub logs
     print("\n".join(report))
 
-    # Send email every run so you never miss anything
-    portfolio_val = float(account["portfolio_value"]) if account else 0
-    profit        = portfolio_val - 100000
-    subject       = f"📊 Bot Report — {now_et.strftime('%b %d %I:%M %p')} ET | P&L: ${profit:+.2f} | Buys: {buys} Sells: {sells}"
-    send_email(subject, report)
+    # Send ONE email at 3:30pm ET run only
+    if now_et.hour == 15 and now_et.minute >= 30:
+        subject = f"📊 Daily Bot Report — {now_et.strftime('%b %d')} | P&L: ${profit:+,.2f} | Buys: {buys} Sells: {sells}"
+        send_email(subject, report)
+        print(f"📧 End of day report sent!")
+    else:
+        print(f"📧 No email this run — sends at 3:30pm ET (now {now_et.strftime('%I:%M %p')} ET)")
 
 # SAFETY RULE 2 — Runs exactly once then exits
 run()
