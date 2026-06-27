@@ -53,6 +53,7 @@ WATCHLIST = [
 
 # =============================================
 # SAFETY RULE 1 — MARKET HOURS FILTER (ET)
+# Extended: 9:00am to 4:30pm ET
 # =============================================
 def is_market_open():
     now_et  = datetime.now(ET)
@@ -61,13 +62,13 @@ def is_market_open():
     if weekday >= 5:
         return False, f"Market closed — {now_et.strftime('%A')} is a weekend"
 
-    market_open  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
-    market_close = now_et.replace(hour=16, minute=0,  second=0, microsecond=0)
+    market_open  = now_et.replace(hour=9,  minute=0,  second=0, microsecond=0)
+    market_close = now_et.replace(hour=16, minute=30, second=0, microsecond=0)
 
     if now_et < market_open:
-        return False, f"Market not open yet — opens 9:30am ET (now {now_et.strftime('%I:%M %p')} ET)"
+        return False, f"Market not open yet — opens 9:00am ET (now {now_et.strftime('%I:%M %p')} ET)"
     if now_et > market_close:
-        return False, f"Market closed for the day — closed 4:00pm ET (now {now_et.strftime('%I:%M %p')} ET)"
+        return False, f"Market closed for the day — closed 4:30pm ET (now {now_et.strftime('%I:%M %p')} ET)"
 
     return True, f"Market OPEN — {now_et.strftime('%I:%M %p')} ET"
 
@@ -428,13 +429,13 @@ def run():
     # Print to GitHub logs
     print("\n".join(report))
 
-    # Send ONE email at 3:30pm ET run only
-    if now_et.hour == 15 and now_et.minute >= 30:
+    # Send ONE email at 4:00pm ET run only
+    if now_et.hour == 16 and now_et.minute == 0:
         subject = f"📊 Daily Bot Report — {now_et.strftime('%b %d')} | P&L: ${profit:+,.2f} | Buys: {buys} Sells: {sells}"
         send_email(subject, report)
         print(f"📧 End of day report sent!")
     else:
-        print(f"📧 No email this run — sends at 3:30pm ET (now {now_et.strftime('%I:%M %p')} ET)")
+        print(f"📧 No email this run — sends at 4:00pm ET (now {now_et.strftime('%I:%M %p')} ET)")
 
 # SAFETY RULE 2 — Runs exactly once then exits
 run()
