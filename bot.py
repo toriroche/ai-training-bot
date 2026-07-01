@@ -38,17 +38,17 @@ RSI_OVERSOLD   = 30
 # Volume Settings
 VOLUME_CONFIRM = 1.2
 
-# Earnings Safety — avoid buying X days before earnings
+# Earnings Safety
 EARNINGS_SAFE_DAYS = 5
 
-# Stock Screener — max new stocks to add per run
+# Stock Screener
 SCREENER_MAX = 5
 
 # Timezone
 ET = ZoneInfo("America/New_York")
 
 # =============================================
-# CORE WATCHLIST — Always monitored
+# CORE WATCHLIST
 # =============================================
 WATCHLIST = [
     "MSFT", "AAPL", "GOOGL", "AMZN", "META",
@@ -59,7 +59,6 @@ WATCHLIST = [
 
 # =============================================
 # SAFETY RULE 1 — MARKET HOURS FILTER (ET)
-# Extended: 9:00am to 4:30pm ET
 # =============================================
 def is_market_open():
     now_et  = datetime.now(ET)
@@ -94,7 +93,6 @@ def get_account():
 def get_positions():
     return alpaca_request("GET", "/v2/positions")
 
-# SAFETY RULE 3 — Minimum $1.00 notional
 def place_fractional_order(symbol, dollars, side):
     if dollars < MIN_ORDER:
         print(f"   ⚠️ {symbol}: ${dollars:.2f} below minimum ${MIN_ORDER:.2f} — skipping")
@@ -123,8 +121,6 @@ def get_stock_data(symbol):
 
 # =============================================
 # EARNINGS AWARENESS
-# Checks if stock has earnings in next 5 days
-# Uses Yahoo Finance earnings calendar — free
 # =============================================
 def has_upcoming_earnings(symbol):
     try:
@@ -132,43 +128,33 @@ def has_upcoming_earnings(symbol):
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=5) as r:
             data = json.loads(r.read())
-
-        events = data.get("quoteSummary", {}).get("result", [{}])[0]
+        events   = data.get("quoteSummary", {}).get("result", [{}])[0]
         earnings = events.get("calendarEvents", {}).get("earnings", {})
-        dates = earnings.get("earningsDate", [])
-
+        dates    = earnings.get("earningsDate", [])
         if not dates:
             return False, "No earnings date found"
-
         now_et    = datetime.now(ET)
         safe_date = now_et + timedelta(days=EARNINGS_SAFE_DAYS)
-
         for d in dates:
             raw  = d.get("raw", 0)
             date = datetime.fromtimestamp(raw, tz=ET)
             if now_et <= date <= safe_date:
                 return True, f"Earnings on {date.strftime('%b %d')}"
-
         return False, "No earnings in next 5 days"
-
     except Exception:
         return False, "Earnings check unavailable"
 
 # =============================================
 # STOCK SCREENER
-# Finds new opportunities beyond watchlist
-# Checks S&P 500 top movers + high volume
 # =============================================
 def screen_new_stocks(held, report):
     report.append(f"\n🔭 STOCK SCREENER — Finding New Opportunities")
     report.append(f"{'='*45}")
-
     candidates = set()
 
-    # Source 1 — S&P 500 Top Movers via Yahoo Finance
     try:
-        movers_url = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_gainers&count=10"
-        req = urllib.request.Request(movers_url, headers={"User-Agent": "Mozilla/5.0"})
+        url = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_gainers&count=10"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=5) as r:
             data = json.loads(r.read())
         quotes = data.get("finance", {}).get("result", [{}])[0].get("quotes", [])
@@ -180,10 +166,9 @@ def screen_new_stocks(held, report):
     except Exception as e:
         report.append(f"   ⚠️ Top movers unavailable: {e}")
 
-    # Source 2 — High Volume Stocks via Yahoo Finance
     try:
-        volume_url = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=most_actives&count=10"
-        req = urllib.request.Request(volume_url, headers={"User-Agent": "Mozilla/5.0"})
+        url = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=most_actives&count=10"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=5) as r:
             data = json.loads(r.read())
         quotes = data.get("finance", {}).get("result", [{}])[0].get("quotes", [])
@@ -195,48 +180,38 @@ def screen_new_stocks(held, report):
     except Exception as e:
         report.append(f"   ⚠️ High volume unavailable: {e}")
 
-    # Analyze candidates
     new_stocks = []
     report.append(f"   🔍 Analyzing {len(candidates)} candidates...\n")
 
     for symbol in list(candidates)[:10]:
         try:
-            prices, volumes = get_stock_data(symbol)
+            prices, volumes      = get_stock_data(symbol)
             if len(prices) < 20:
                 continue
-
-            ma_signal, strength = get_ma_signal(prices)
-            rsi                 = get_rsi(prices)
+            ma_signal, strength  = get_ma_signal(prices)
+            rsi                  = get_rsi(prices)
             vol_confirmed, ratio = get_volume_signal(volumes)
-            earnings, e_msg     = has_upcoming_earnings(symbol)
-            price               = prices[-1]
-
-            # Score
+            earnings, e_msg      = has_upcoming_earnings(symbol)
+            price                = prices[-1]
             score = 0
-            if ma_signal == "BUY":   score += 40
-            if rsi < RSI_OVERSOLD:   score += 30
-            elif rsi < 50:           score += 15
-            if vol_confirmed:        score += 20
-            if earnings:             score -= 50  # Heavy penalty
-
+            if ma_signal == "BUY": score += 40
+            if rsi < RSI_OVERSOLD: score += 30
+            elif rsi < 50:         score += 15
+            if vol_confirmed:      score += 20
+            if earnings:           score -= 50
             if score >= 60:
                 new_stocks.append({
-                    "symbol":   symbol,
-                    "price":    price,
-                    "score":    score,
-                    "rsi":      rsi,
-                    "earnings": earnings,
-                    "e_msg":    e_msg,
+                    "symbol": symbol, "price": price,
+                    "score": score, "rsi": rsi,
                 })
-                report.append(f"   🌟 {symbol} @ ${price:.2f} — Score: {score}/100 | RSI: {rsi} | {e_msg}")
-
+                report.append(f"   🌟 {symbol} @ ${price:.2f} — Score: {score}/100 | RSI: {rsi}")
         except Exception:
             continue
 
     if not new_stocks:
         report.append(f"   — No strong candidates found this cycle")
     else:
-        report.append(f"\n   ✅ {len(new_stocks)} new stock(s) added to this cycle's watchlist")
+        report.append(f"\n   ✅ {len(new_stocks)} new stock(s) added to watchlist")
 
     return [s["symbol"] for s in sorted(new_stocks, key=lambda x: x["score"], reverse=True)[:SCREENER_MAX]]
 
@@ -275,7 +250,6 @@ def get_volume_signal(volumes):
     ratio         = latest_volume / avg_volume if avg_volume > 0 else 1.0
     return ratio >= VOLUME_CONFIRM, round(ratio, 2)
 
-# SAFETY RULE 4 — News API Failsafe
 def get_news_sentiment(symbol):
     try:
         url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol}&region=US&lang=en-US"
@@ -303,17 +277,17 @@ def full_analysis(symbol):
     news_sentiment, pos, neg = get_news_sentiment(symbol)
     price                    = prices[-1]
     score = 0
-    if ma_signal == "BUY":       score += 40
-    elif ma_signal == "SELL":    score -= 40
-    if rsi < RSI_OVERSOLD:       score += 30
-    elif rsi < 50:               score += 15
-    elif rsi > RSI_OVERBOUGHT:   score -= 30
-    else:                        score += 5
-    if vol_confirmed:            score += 20
-    else:                        score += 5
-    if news_sentiment == "POSITIVE":  score += 10
+    if ma_signal == "BUY":        score += 40
+    elif ma_signal == "SELL":     score -= 40
+    if rsi < RSI_OVERSOLD:        score += 30
+    elif rsi < 50:                score += 15
+    elif rsi > RSI_OVERBOUGHT:    score -= 30
+    else:                         score += 5
+    if vol_confirmed:             score += 20
+    else:                         score += 5
+    if news_sentiment == "POSITIVE":   score += 10
     elif news_sentiment == "NEGATIVE": score -= 10
-    if score >= 60:   final_signal = "BUY"
+    if score >= 60:    final_signal = "BUY"
     elif score <= -20: final_signal = "SELL"
     else:              final_signal = "HOLD"
     return {
@@ -383,7 +357,6 @@ def run():
     report.append(f"🧠 MA + RSI + Volume + News + Earnings + Screener")
     report.append("="*45)
 
-    # SAFETY RULE 1 — Market hours
     market_open, market_msg = is_market_open()
     report.append(f"🕐 {market_msg}")
 
@@ -395,7 +368,6 @@ def run():
 
     report.append("="*45)
 
-    # Get account
     account = None
     profit  = 0
     try:
@@ -411,7 +383,6 @@ def run():
         print("\n".join(report))
         return
 
-    # Get positions
     try:
         positions = get_positions()
         held      = {p["symbol"]: p for p in positions}
@@ -425,11 +396,9 @@ def run():
     report.append(f"📅 Earnings buffer: {EARNINGS_SAFE_DAYS} days")
     report.append("="*45)
 
-    # Run stock screener to find new opportunities
     screener_stocks = screen_new_stocks(held, report)
+    full_watchlist  = list(WATCHLIST) + screener_stocks
 
-    # Combine watchlist + screener results
-    full_watchlist = list(WATCHLIST) + screener_stocks
     report.append(f"\n🔍 SCANNING {len(full_watchlist)} STOCKS ({len(WATCHLIST)} core + {len(screener_stocks)} screener)...\n")
 
     buy_signals  = []
@@ -437,13 +406,12 @@ def run():
 
     for symbol in full_watchlist:
         try:
-            a         = full_analysis(symbol)
-            rsi_label = "oversold 🟢" if a["rsi"] < RSI_OVERSOLD else "overbought 🔴" if a["rsi"] > RSI_OVERBOUGHT else "normal ⚪"
-            vol_label = "✅ confirmed" if a["volume"] >= VOLUME_CONFIRM else "⚠️ low"
-            emoji     = "🟢" if a["signal"] == "BUY" else "🔴" if a["signal"] == "SELL" else "⏳"
-
-            # Earnings check before buying
+            a             = full_analysis(symbol)
+            rsi_label     = "oversold 🟢" if a["rsi"] < RSI_OVERSOLD else "overbought 🔴" if a["rsi"] > RSI_OVERBOUGHT else "normal ⚪"
+            vol_label     = "✅ confirmed" if a["volume"] >= VOLUME_CONFIRM else "⚠️ low"
+            emoji         = "🟢" if a["signal"] == "BUY" else "🔴" if a["signal"] == "SELL" else "⏳"
             earnings_soon, e_msg = has_upcoming_earnings(symbol)
+
             if a["signal"] == "BUY" and earnings_soon:
                 a["signal"] = "HOLD"
                 report.append(f"   ⚠️ {symbol} @ ${a['price']:.2f} — BUY blocked: {e_msg}")
@@ -464,7 +432,6 @@ def run():
         except Exception as e:
             report.append(f"   ⚠️ {symbol}: Error — {e}")
 
-    # Position management
     report.append(f"{'='*45}")
     report.append(f"📦 POSITION MANAGEMENT")
     report.append(f"{'='*45}")
@@ -486,7 +453,6 @@ def run():
         except Exception as e:
             report.append(f"   ⚠️ {symbol}: {e}")
 
-    # Sells
     report.append(f"\n{'='*45}")
     report.append(f"📤 SELLING")
     report.append(f"{'='*45}")
@@ -503,7 +469,6 @@ def run():
     if sells == 0:
         report.append(f"   — Nothing to sell this cycle")
 
-    # Buys
     report.append(f"\n{'='*45}")
     report.append(f"📥 BUYING")
     report.append(f"{'='*45}")
@@ -532,7 +497,6 @@ def run():
     if buys == 0:
         report.append(f"   — No strong BUY signals this cycle")
 
-    # Final summary
     report.append(f"\n{'='*45}")
     report.append(f"📊 END OF DAY SUMMARY")
     report.append(f"{'='*45}")
@@ -548,15 +512,15 @@ def run():
     report.append(f"✅ See you tomorrow!")
     report.append(f"{'='*45}")
 
-    # Print to logs
     print("\n".join(report))
 
-    # Send ONE email at 4:00pm ET run only
-if now_et.hour == 16:        subject = f"📊 Daily Bot Report — {now_et.strftime('%b %d')} | P&L: ${profit:+,.2f} | Buys: {buys} Sells: {sells}"
+    # Send ONE email during the 4pm ET hour
+    if now_et.hour == 16:
+        subject = f"📊 Daily Bot Report — {now_et.strftime('%b %d')} | P&L: ${profit:+,.2f} | Buys: {buys} Sells: {sells}"
         send_email(subject, report)
         print(f"📧 End of day report sent!")
     else:
-        print(f"📧 No email this run — sends at 4:00pm ET (now {now_et.strftime('%I:%M %p')} ET)")
+        print(f"📧 No email this run — sends at 4pm ET (now {now_et.strftime('%I:%M %p')} ET)")
 
 # SAFETY RULE 2 — Runs exactly once then exits
 run()
