@@ -1,7 +1,7 @@
 import urllib.request
 import json
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import smtplib
 from email.mime.text import MIMEText
@@ -38,11 +38,17 @@ RSI_OVERSOLD   = 30
 # Volume Settings
 VOLUME_CONFIRM = 1.2
 
+# Earnings Safety — avoid buying X days before earnings
+EARNINGS_SAFE_DAYS = 5
+
+# Stock Screener — max new stocks to add per run
+SCREENER_MAX = 5
+
 # Timezone
 ET = ZoneInfo("America/New_York")
 
 # =============================================
-# WATCHLIST
+# CORE WATCHLIST — Always monitored
 # =============================================
 WATCHLIST = [
     "MSFT", "AAPL", "GOOGL", "AMZN", "META",
@@ -58,18 +64,14 @@ WATCHLIST = [
 def is_market_open():
     now_et  = datetime.now(ET)
     weekday = now_et.weekday()
-
     if weekday >= 5:
         return False, f"Market closed — {now_et.strftime('%A')} is a weekend"
-
     market_open  = now_et.replace(hour=9,  minute=0,  second=0, microsecond=0)
     market_close = now_et.replace(hour=16, minute=30, second=0, microsecond=0)
-
     if now_et < market_open:
         return False, f"Market not open yet — opens 9:00am ET (now {now_et.strftime('%I:%M %p')} ET)"
     if now_et > market_close:
         return False, f"Market closed for the day — closed 4:30pm ET (now {now_et.strftime('%I:%M %p')} ET)"
-
     return True, f"Market OPEN — {now_et.strftime('%I:%M %p')} ET"
 
 # =============================================
@@ -118,6 +120,125 @@ def get_stock_data(symbol):
     closes  = [p for p in quotes["close"]  if p is not None]
     volumes = [v for v in quotes["volume"] if v is not None]
     return closes, volumes
+
+# =============================================
+# EARNINGS AWARENESS
+# Checks if stock has earnings in next 5 days
+# Uses Yahoo Finance earnings calendar — free
+# =============================================
+def has_upcoming_earnings(symbol):
+    try:
+        url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}?modules=calendarEvents"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.loads(r.read())
+
+        events = data.get("quoteSummary", {}).get("result", [{}])[0]
+        earnings = events.get("calendarEvents", {}).get("earnings", {})
+        dates = earnings.get("earningsDate", [])
+
+        if not dates:
+            return False, "No earnings date found"
+
+        now_et    = datetime.now(ET)
+        safe_date = now_et + timedelta(days=EARNINGS_SAFE_DAYS)
+
+        for d in dates:
+            raw  = d.get("raw", 0)
+            date = datetime.fromtimestamp(raw, tz=ET)
+            if now_et <= date <= safe_date:
+                return True, f"Earnings on {date.strftime('%b %d')}"
+
+        return False, "No earnings in next 5 days"
+
+    except Exception:
+        return False, "Earnings check unavailable"
+
+# =============================================
+# STOCK SCREENER
+# Finds new opportunities beyond watchlist
+# Checks S&P 500 top movers + high volume
+# =============================================
+def screen_new_stocks(held, report):
+    report.append(f"\n🔭 STOCK SCREENER — Finding New Opportunities")
+    report.append(f"{'='*45}")
+
+    candidates = set()
+
+    # Source 1 — S&P 500 Top Movers via Yahoo Finance
+    try:
+        movers_url = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_gainers&count=10"
+        req = urllib.request.Request(movers_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.loads(r.read())
+        quotes = data.get("finance", {}).get("result", [{}])[0].get("quotes", [])
+        for q in quotes:
+            sym = q.get("symbol", "")
+            if sym and sym not in WATCHLIST and sym not in held:
+                candidates.add(sym)
+        report.append(f"   📈 Top movers found: {len(quotes)} stocks")
+    except Exception as e:
+        report.append(f"   ⚠️ Top movers unavailable: {e}")
+
+    # Source 2 — High Volume Stocks via Yahoo Finance
+    try:
+        volume_url = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=most_actives&count=10"
+        req = urllib.request.Request(volume_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.loads(r.read())
+        quotes = data.get("finance", {}).get("result", [{}])[0].get("quotes", [])
+        for q in quotes:
+            sym = q.get("symbol", "")
+            if sym and sym not in WATCHLIST and sym not in held:
+                candidates.add(sym)
+        report.append(f"   📊 High volume found: {len(quotes)} stocks")
+    except Exception as e:
+        report.append(f"   ⚠️ High volume unavailable: {e}")
+
+    # Analyze candidates
+    new_stocks = []
+    report.append(f"   🔍 Analyzing {len(candidates)} candidates...\n")
+
+    for symbol in list(candidates)[:10]:
+        try:
+            prices, volumes = get_stock_data(symbol)
+            if len(prices) < 20:
+                continue
+
+            ma_signal, strength = get_ma_signal(prices)
+            rsi                 = get_rsi(prices)
+            vol_confirmed, ratio = get_volume_signal(volumes)
+            earnings, e_msg     = has_upcoming_earnings(symbol)
+            price               = prices[-1]
+
+            # Score
+            score = 0
+            if ma_signal == "BUY":   score += 40
+            if rsi < RSI_OVERSOLD:   score += 30
+            elif rsi < 50:           score += 15
+            if vol_confirmed:        score += 20
+            if earnings:             score -= 50  # Heavy penalty
+
+            if score >= 60:
+                new_stocks.append({
+                    "symbol":   symbol,
+                    "price":    price,
+                    "score":    score,
+                    "rsi":      rsi,
+                    "earnings": earnings,
+                    "e_msg":    e_msg,
+                })
+                report.append(f"   🌟 {symbol} @ ${price:.2f} — Score: {score}/100 | RSI: {rsi} | {e_msg}")
+
+        except Exception:
+            continue
+
+    if not new_stocks:
+        report.append(f"   — No strong candidates found this cycle")
+    else:
+        report.append(f"\n   ✅ {len(new_stocks)} new stock(s) added to this cycle's watchlist")
+
+    return [s["symbol"] for s in sorted(new_stocks, key=lambda x: x["score"], reverse=True)[:SCREENER_MAX]]
 
 # =============================================
 # TECHNICAL INDICATORS
@@ -182,32 +303,19 @@ def full_analysis(symbol):
     news_sentiment, pos, neg = get_news_sentiment(symbol)
     price                    = prices[-1]
     score = 0
-    if ma_signal == "BUY":
-        score += 40
-    elif ma_signal == "SELL":
-        score -= 40
-    if rsi < RSI_OVERSOLD:
-        score += 30
-    elif rsi < 50:
-        score += 15
-    elif rsi > RSI_OVERBOUGHT:
-        score -= 30
-    else:
-        score += 5
-    if vol_confirmed:
-        score += 20
-    else:
-        score += 5
-    if news_sentiment == "POSITIVE":
-        score += 10
-    elif news_sentiment == "NEGATIVE":
-        score -= 10
-    if score >= 60:
-        final_signal = "BUY"
-    elif score <= -20:
-        final_signal = "SELL"
-    else:
-        final_signal = "HOLD"
+    if ma_signal == "BUY":       score += 40
+    elif ma_signal == "SELL":    score -= 40
+    if rsi < RSI_OVERSOLD:       score += 30
+    elif rsi < 50:               score += 15
+    elif rsi > RSI_OVERBOUGHT:   score -= 30
+    else:                        score += 5
+    if vol_confirmed:            score += 20
+    else:                        score += 5
+    if news_sentiment == "POSITIVE":  score += 10
+    elif news_sentiment == "NEGATIVE": score -= 10
+    if score >= 60:   final_signal = "BUY"
+    elif score <= -20: final_signal = "SELL"
+    else:              final_signal = "HOLD"
     return {
         "symbol":   symbol,
         "price":    price,
@@ -271,11 +379,11 @@ def run():
     report.append(f"📅 {now_et.strftime('%A %B %d, %Y')}")
     report.append(f"⏰ Generated: {now_et.strftime('%I:%M %p')} ET")
     report.append(f"💰 Weekly Budget: ${WEEKLY_BUDGET:,}")
-    report.append(f"👁 Watching {len(WATCHLIST)} stocks")
-    report.append(f"🧠 MA + RSI + Volume + News")
+    report.append(f"👁 Core watchlist: {len(WATCHLIST)} stocks")
+    report.append(f"🧠 MA + RSI + Volume + News + Earnings + Screener")
     report.append("="*45)
 
-    # SAFETY RULE 1 — Market hours check
+    # SAFETY RULE 1 — Market hours
     market_open, market_msg = is_market_open()
     report.append(f"🕐 {market_msg}")
 
@@ -314,30 +422,45 @@ def run():
     budget_per_stock = round(WEEKLY_BUDGET / MAX_POSITIONS, 2)
     report.append(f"📊 Per position:    ${budget_per_stock:.2f}")
     report.append(f"🛡 Min order:       ${MIN_ORDER:.2f}")
+    report.append(f"📅 Earnings buffer: {EARNINGS_SAFE_DAYS} days")
     report.append("="*45)
 
-    # Scan stocks
-    report.append(f"\n🔍 SCANNING {len(WATCHLIST)} STOCKS...\n")
+    # Run stock screener to find new opportunities
+    screener_stocks = screen_new_stocks(held, report)
+
+    # Combine watchlist + screener results
+    full_watchlist = list(WATCHLIST) + screener_stocks
+    report.append(f"\n🔍 SCANNING {len(full_watchlist)} STOCKS ({len(WATCHLIST)} core + {len(screener_stocks)} screener)...\n")
 
     buy_signals  = []
     sell_signals = []
 
-    for symbol in WATCHLIST:
+    for symbol in full_watchlist:
         try:
             a         = full_analysis(symbol)
             rsi_label = "oversold 🟢" if a["rsi"] < RSI_OVERSOLD else "overbought 🔴" if a["rsi"] > RSI_OVERBOUGHT else "normal ⚪"
             vol_label = "✅ confirmed" if a["volume"] >= VOLUME_CONFIRM else "⚠️ low"
             emoji     = "🟢" if a["signal"] == "BUY" else "🔴" if a["signal"] == "SELL" else "⏳"
-            report.append(f"   {emoji} {symbol} @ ${a['price']:.2f}")
-            report.append(f"      Score: {a['score']}/100 | Signal: {a['signal']}")
-            report.append(f"      MA: {a['ma']} | RSI: {a['rsi']} ({rsi_label})")
-            report.append(f"      Volume: {a['volume']}x avg ({vol_label})")
-            report.append(f"      News: {a['news']} 📰")
-            report.append("")
+
+            # Earnings check before buying
+            earnings_soon, e_msg = has_upcoming_earnings(symbol)
+            if a["signal"] == "BUY" and earnings_soon:
+                a["signal"] = "HOLD"
+                report.append(f"   ⚠️ {symbol} @ ${a['price']:.2f} — BUY blocked: {e_msg}")
+            else:
+                report.append(f"   {emoji} {symbol} @ ${a['price']:.2f}")
+                report.append(f"      Score: {a['score']}/100 | Signal: {a['signal']}")
+                report.append(f"      MA: {a['ma']} | RSI: {a['rsi']} ({rsi_label})")
+                report.append(f"      Volume: {a['volume']}x avg ({vol_label})")
+                report.append(f"      News: {a['news']} 📰")
+                report.append(f"      Earnings: {e_msg} 📅")
+                report.append("")
+
             if a["signal"] == "BUY" and symbol not in held:
                 buy_signals.append(a)
             elif a["signal"] == "SELL" and symbol in held:
                 sell_signals.append(symbol)
+
         except Exception as e:
             report.append(f"   ⚠️ {symbol}: Error — {e}")
 
@@ -351,13 +474,11 @@ def run():
             unrealized = float(pos["unrealized_pl"])
             gain_pct   = float(pos["unrealized_plpc"])
             if gain_pct >= TAKE_PROFIT:
-                result = place_fractional_order(
-                    symbol, float(pos["market_value"]), "sell")
+                result = place_fractional_order(symbol, float(pos["market_value"]), "sell")
                 if result:
                     report.append(f"   💰 TAKE PROFIT {symbol}: +${unrealized:.2f} ({gain_pct*100:+.2f}%)")
             elif gain_pct <= -STOP_LOSS:
-                result = place_fractional_order(
-                    symbol, float(pos["market_value"]), "sell")
+                result = place_fractional_order(symbol, float(pos["market_value"]), "sell")
                 if result:
                     report.append(f"   🛑 STOP LOSS {symbol}: ${unrealized:.2f} ({gain_pct*100:+.2f}%)")
             else:
@@ -373,8 +494,7 @@ def run():
     for symbol in sell_signals:
         if symbol in held:
             try:
-                result = place_fractional_order(
-                    symbol, float(held[symbol]["market_value"]), "sell")
+                result = place_fractional_order(symbol, float(held[symbol]["market_value"]), "sell")
                 if result:
                     report.append(f"   🔴 SOLD {symbol}")
                     sells += 1
@@ -416,7 +536,9 @@ def run():
     report.append(f"\n{'='*45}")
     report.append(f"📊 END OF DAY SUMMARY")
     report.append(f"{'='*45}")
-    report.append(f"   Stocks monitored: {len(WATCHLIST)}")
+    report.append(f"   Core stocks:      {len(WATCHLIST)}")
+    report.append(f"   Screener finds:   {len(screener_stocks)}")
+    report.append(f"   Total scanned:    {len(full_watchlist)}")
     report.append(f"   BUY signals:      {len(buy_signals)}")
     report.append(f"   Buys executed:    {buys}")
     report.append(f"   Sells executed:   {sells}")
@@ -426,7 +548,7 @@ def run():
     report.append(f"✅ See you tomorrow!")
     report.append(f"{'='*45}")
 
-    # Print to GitHub logs
+    # Print to logs
     print("\n".join(report))
 
     # Send ONE email at 4:00pm ET run only
