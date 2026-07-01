@@ -552,8 +552,7 @@ def run():
     print("\n".join(report))
 
     # Send ONE email at 4:00pm ET run only
-    if now_et.hour == 16 and now_et.minute == 0:
-        subject = f"📊 Daily Bot Report — {now_et.strftime('%b %d')} | P&L: ${profit:+,.2f} | Buys: {buys} Sells: {sells}"
+if now_et.hour == 16:        subject = f"📊 Daily Bot Report — {now_et.strftime('%b %d')} | P&L: ${profit:+,.2f} | Buys: {buys} Sells: {sells}"
         send_email(subject, report)
         print(f"📧 End of day report sent!")
     else:
