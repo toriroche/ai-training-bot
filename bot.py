@@ -22,33 +22,35 @@ EMAIL_ADDRESS  = os.environ.get("EMAIL_ADDRESS")
 EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")
 
 # =============================================
-# WEEKLY TEST BUDGET — ONLY CHANGE THIS
+# AGGRESSIVE INTRADAY SETTINGS
 # =============================================
-WEEKLY_BUDGET  = 100
-STOP_LOSS      = 0.02
-TAKE_PROFIT    = 0.04
-MAX_POSITIONS  = 3
-MIN_ORDER      = 1.00
+WEEKLY_BUDGET    = 100
+STOP_LOSS        = 0.01    # 1% stop loss — tighter protection
+TAKE_PROFIT      = 0.02    # 2% take profit — faster wins
+MAX_POSITIONS    = 3
+MIN_ORDER        = 1.00
+CLOSE_BY_HOUR   = 15       # Close all positions by 3:30pm ET
+CLOSE_BY_MINUTE = 30
 
-# RSI Settings
-RSI_PERIOD     = 14
-RSI_OVERBOUGHT = 70
-RSI_OVERSOLD   = 30
+# RSI Settings — more aggressive
+RSI_PERIOD     = 10        # Shorter = more sensitive
+RSI_OVERBOUGHT = 65        # Lower threshold = sells sooner
+RSI_OVERSOLD   = 35        # Higher threshold = buys sooner
 
 # Volume Settings
-VOLUME_CONFIRM = 1.2
+VOLUME_CONFIRM = 1.5       # Higher volume confirmation required
 
 # Earnings Safety
 EARNINGS_SAFE_DAYS = 5
 
-# Stock Screener
+# Screener
 SCREENER_MAX = 5
 
 # Timezone
 ET = ZoneInfo("America/New_York")
 
 # =============================================
-# CORE WATCHLIST
+# WATCHLIST
 # =============================================
 WATCHLIST = [
     "MSFT", "AAPL", "GOOGL", "AMZN", "META",
@@ -58,7 +60,7 @@ WATCHLIST = [
 ]
 
 # =============================================
-# SAFETY RULE 1 — MARKET HOURS FILTER (ET)
+# SAFETY RULE 1 — MARKET HOURS (ET)
 # =============================================
 def is_market_open():
     now_et  = datetime.now(ET)
@@ -70,8 +72,12 @@ def is_market_open():
     if now_et < market_open:
         return False, f"Market not open yet — opens 9:00am ET (now {now_et.strftime('%I:%M %p')} ET)"
     if now_et > market_close:
-        return False, f"Market closed for the day — closed 4:30pm ET (now {now_et.strftime('%I:%M %p')} ET)"
+        return False, f"Market closed — closed 4:30pm ET (now {now_et.strftime('%I:%M %p')} ET)"
     return True, f"Market OPEN — {now_et.strftime('%I:%M %p')} ET"
+
+def is_end_of_day():
+    now_et = datetime.now(ET)
+    return (now_et.hour == CLOSE_BY_HOUR and now_et.minute >= CLOSE_BY_MINUTE) or now_et.hour > CLOSE_BY_HOUR
 
 # =============================================
 # ALPACA API
@@ -95,7 +101,7 @@ def get_positions():
 
 def place_fractional_order(symbol, dollars, side):
     if dollars < MIN_ORDER:
-        print(f"   ⚠️ {symbol}: ${dollars:.2f} below minimum ${MIN_ORDER:.2f} — skipping")
+        print(f"   ⚠️ {symbol}: ${dollars:.2f} below minimum — skipping")
         return None
     return alpaca_request("POST", "/v2/orders", {
         "symbol":        symbol,
@@ -105,11 +111,34 @@ def place_fractional_order(symbol, dollars, side):
         "time_in_force": "day"
     })
 
+def close_all_positions(report):
+    report.append(f"\n🔔 END OF DAY — Closing all positions")
+    try:
+        positions = get_positions()
+        if not positions:
+            report.append(f"   — No open positions to close")
+            return 0
+        total_pl = 0
+        for pos in positions:
+            symbol     = pos["symbol"]
+            market_val = float(pos["market_value"])
+            pl         = float(pos["unrealized_pl"])
+            result     = place_fractional_order(symbol, market_val, "sell")
+            if result:
+                total_pl += pl
+                emoji = "💰" if pl >= 0 else "🛑"
+                report.append(f"   {emoji} Closed {symbol}: P&L ${pl:+.2f}")
+        report.append(f"   📊 Total closed P&L: ${total_pl:+.2f}")
+        return total_pl
+    except Exception as e:
+        report.append(f"   ⚠️ Error closing positions: {e}")
+        return 0
+
 # =============================================
 # MARKET DATA
 # =============================================
 def get_stock_data(symbol):
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=6mo"
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=3mo"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req) as r:
         data = json.loads(r.read())
@@ -120,115 +149,26 @@ def get_stock_data(symbol):
     return closes, volumes
 
 # =============================================
-# EARNINGS AWARENESS
-# =============================================
-def has_upcoming_earnings(symbol):
-    try:
-        url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}?modules=calendarEvents"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=5) as r:
-            data = json.loads(r.read())
-        events   = data.get("quoteSummary", {}).get("result", [{}])[0]
-        earnings = events.get("calendarEvents", {}).get("earnings", {})
-        dates    = earnings.get("earningsDate", [])
-        if not dates:
-            return False, "No earnings date found"
-        now_et    = datetime.now(ET)
-        safe_date = now_et + timedelta(days=EARNINGS_SAFE_DAYS)
-        for d in dates:
-            raw  = d.get("raw", 0)
-            date = datetime.fromtimestamp(raw, tz=ET)
-            if now_et <= date <= safe_date:
-                return True, f"Earnings on {date.strftime('%b %d')}"
-        return False, "No earnings in next 5 days"
-    except Exception:
-        return False, "Earnings check unavailable"
-
-# =============================================
-# STOCK SCREENER
-# =============================================
-def screen_new_stocks(held, report):
-    report.append(f"\n🔭 STOCK SCREENER — Finding New Opportunities")
-    report.append(f"{'='*45}")
-    candidates = set()
-
-    try:
-        url = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_gainers&count=10"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=5) as r:
-            data = json.loads(r.read())
-        quotes = data.get("finance", {}).get("result", [{}])[0].get("quotes", [])
-        for q in quotes:
-            sym = q.get("symbol", "")
-            if sym and sym not in WATCHLIST and sym not in held:
-                candidates.add(sym)
-        report.append(f"   📈 Top movers found: {len(quotes)} stocks")
-    except Exception as e:
-        report.append(f"   ⚠️ Top movers unavailable: {e}")
-
-    try:
-        url = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=most_actives&count=10"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=5) as r:
-            data = json.loads(r.read())
-        quotes = data.get("finance", {}).get("result", [{}])[0].get("quotes", [])
-        for q in quotes:
-            sym = q.get("symbol", "")
-            if sym and sym not in WATCHLIST and sym not in held:
-                candidates.add(sym)
-        report.append(f"   📊 High volume found: {len(quotes)} stocks")
-    except Exception as e:
-        report.append(f"   ⚠️ High volume unavailable: {e}")
-
-    new_stocks = []
-    report.append(f"   🔍 Analyzing {len(candidates)} candidates...\n")
-
-    for symbol in list(candidates)[:10]:
-        try:
-            prices, volumes      = get_stock_data(symbol)
-            if len(prices) < 20:
-                continue
-            ma_signal, strength  = get_ma_signal(prices)
-            rsi                  = get_rsi(prices)
-            vol_confirmed, ratio = get_volume_signal(volumes)
-            earnings, e_msg      = has_upcoming_earnings(symbol)
-            price                = prices[-1]
-            score = 0
-            if ma_signal == "BUY": score += 40
-            if rsi < RSI_OVERSOLD: score += 30
-            elif rsi < 50:         score += 15
-            if vol_confirmed:      score += 20
-            if earnings:           score -= 50
-            if score >= 60:
-                new_stocks.append({
-                    "symbol": symbol, "price": price,
-                    "score": score, "rsi": rsi,
-                })
-                report.append(f"   🌟 {symbol} @ ${price:.2f} — Score: {score}/100 | RSI: {rsi}")
-        except Exception:
-            continue
-
-    if not new_stocks:
-        report.append(f"   — No strong candidates found this cycle")
-    else:
-        report.append(f"\n   ✅ {len(new_stocks)} new stock(s) added to watchlist")
-
-    return [s["symbol"] for s in sorted(new_stocks, key=lambda x: x["score"], reverse=True)[:SCREENER_MAX]]
-
-# =============================================
-# TECHNICAL INDICATORS
+# TECHNICAL INDICATORS — AGGRESSIVE VERSION
 # =============================================
 def get_ma_signal(prices):
     df = pd.DataFrame(prices, columns=["close"])
     df["short"] = df["close"].rolling(5).mean()
     df["long"]  = df["close"].rolling(15).mean()
+    df["mom"]   = df["close"].pct_change(3)  # 3-day momentum
     l = df.iloc[-1]
     p = df.iloc[-2]
     strength = ((l["short"] - l["long"]) / l["long"]) * 100
-    if p["short"] <= p["long"] and l["short"] > l["long"]:
+
+    # Buy signal — MA crossover + positive momentum
+    if p["short"] <= p["long"] and l["short"] > l["long"] and l["mom"] > 0:
         return "BUY", round(strength, 4)
-    elif p["short"] >= p["long"] and l["short"] < l["long"]:
+    # Sell signal — MA crossover + negative momentum
+    elif p["short"] >= p["long"] and l["short"] < l["long"] and l["mom"] < 0:
         return "SELL", round(strength, 4)
+    # Strong momentum buy even without crossover
+    elif l["mom"] > 0.02 and l["short"] > l["long"]:
+        return "BUY", round(strength, 4)
     return "HOLD", round(strength, 4)
 
 def get_rsi(prices):
@@ -250,6 +190,36 @@ def get_volume_signal(volumes):
     ratio         = latest_volume / avg_volume if avg_volume > 0 else 1.0
     return ratio >= VOLUME_CONFIRM, round(ratio, 2)
 
+def get_momentum_score(prices):
+    if len(prices) < 10:
+        return 0
+    day1  = (prices[-1] - prices[-2])  / prices[-2] * 100
+    day3  = (prices[-1] - prices[-4])  / prices[-4] * 100
+    day5  = (prices[-1] - prices[-6])  / prices[-6] * 100
+    score = (day1 * 0.5) + (day3 * 0.3) + (day5 * 0.2)
+    return round(score, 4)
+
+def has_upcoming_earnings(symbol):
+    try:
+        url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}?modules=calendarEvents"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.loads(r.read())
+        events   = data.get("quoteSummary", {}).get("result", [{}])[0]
+        earnings = events.get("calendarEvents", {}).get("earnings", {})
+        dates    = earnings.get("earningsDate", [])
+        if not dates:
+            return False, "No earnings date"
+        now_et    = datetime.now(ET)
+        safe_date = now_et + timedelta(days=EARNINGS_SAFE_DAYS)
+        for d in dates:
+            date = datetime.fromtimestamp(d.get("raw", 0), tz=ET)
+            if now_et <= date <= safe_date:
+                return True, f"Earnings {date.strftime('%b %d')}"
+        return False, "Clear"
+    except Exception:
+        return False, "Unknown"
+
 def get_news_sentiment(symbol):
     try:
         url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol}&region=US&lang=en-US"
@@ -261,10 +231,8 @@ def get_news_sentiment(symbol):
         content_lower = content.lower()
         pos_count = sum(content_lower.count(w) for w in positive_words)
         neg_count = sum(content_lower.count(w) for w in negative_words)
-        if pos_count > neg_count * 1.5:
-            return "POSITIVE", pos_count, neg_count
-        elif neg_count > pos_count * 1.5:
-            return "NEGATIVE", pos_count, neg_count
+        if pos_count > neg_count * 1.5:   return "POSITIVE", pos_count, neg_count
+        elif neg_count > pos_count * 1.5: return "NEGATIVE", pos_count, neg_count
         return "NEUTRAL", pos_count, neg_count
     except Exception:
         return "NEUTRAL", 0, 0
@@ -275,21 +243,38 @@ def full_analysis(symbol):
     rsi                      = get_rsi(prices)
     vol_confirmed, vol_ratio = get_volume_signal(volumes)
     news_sentiment, pos, neg = get_news_sentiment(symbol)
+    momentum                 = get_momentum_score(prices)
     price                    = prices[-1]
+
     score = 0
-    if ma_signal == "BUY":        score += 40
-    elif ma_signal == "SELL":     score -= 40
-    if rsi < RSI_OVERSOLD:        score += 30
-    elif rsi < 50:                score += 15
-    elif rsi > RSI_OVERBOUGHT:    score -= 30
+    # MA Signal (35 points)
+    if ma_signal == "BUY":        score += 35
+    elif ma_signal == "SELL":     score -= 35
+
+    # RSI (25 points) — more aggressive thresholds
+    if rsi < RSI_OVERSOLD:        score += 25
+    elif rsi < 45:                score += 12
+    elif rsi > RSI_OVERBOUGHT:    score -= 25
     else:                         score += 5
+
+    # Volume (20 points)
     if vol_confirmed:             score += 20
-    else:                         score += 5
-    if news_sentiment == "POSITIVE":   score += 10
-    elif news_sentiment == "NEGATIVE": score -= 10
-    if score >= 60:    final_signal = "BUY"
+    else:                         score += 3
+
+    # Momentum (15 points) — NEW
+    if momentum > 1.0:            score += 15
+    elif momentum > 0.5:          score += 8
+    elif momentum < -1.0:         score -= 15
+    elif momentum < -0.5:         score -= 8
+
+    # News (5 points)
+    if news_sentiment == "POSITIVE":   score += 5
+    elif news_sentiment == "NEGATIVE": score -= 5
+
+    if score >= 55:    final_signal = "BUY"
     elif score <= -20: final_signal = "SELL"
     else:              final_signal = "HOLD"
+
     return {
         "symbol":   symbol,
         "price":    price,
@@ -299,16 +284,65 @@ def full_analysis(symbol):
         "rsi":      rsi,
         "volume":   vol_ratio,
         "news":     news_sentiment,
+        "momentum": momentum,
         "strength": strength,
     }
 
+def screen_new_stocks(held, report):
+    report.append(f"\n🔭 SCREENER — Finding Opportunities")
+    report.append(f"{'='*45}")
+    candidates = set()
+
+    for scrId in ["day_gainers", "most_actives"]:
+        try:
+            url = f"https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds={scrId}&count=10"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                data = json.loads(r.read())
+            quotes = data.get("finance", {}).get("result", [{}])[0].get("quotes", [])
+            for q in quotes:
+                sym = q.get("symbol", "")
+                if sym and sym not in WATCHLIST and sym not in held:
+                    candidates.add(sym)
+            report.append(f"   📊 {scrId}: {len(quotes)} stocks found")
+        except Exception as e:
+            report.append(f"   ⚠️ {scrId}: {e}")
+
+    new_stocks = []
+    for symbol in list(candidates)[:10]:
+        try:
+            prices, volumes      = get_stock_data(symbol)
+            if len(prices) < 20: continue
+            ma_signal, _         = get_ma_signal(prices)
+            rsi                  = get_rsi(prices)
+            vol_confirmed, ratio = get_volume_signal(volumes)
+            momentum             = get_momentum_score(prices)
+            earnings, e_msg      = has_upcoming_earnings(symbol)
+            price                = prices[-1]
+            score = 0
+            if ma_signal == "BUY": score += 35
+            if rsi < RSI_OVERSOLD: score += 25
+            if vol_confirmed:      score += 20
+            if momentum > 0.5:     score += 15
+            if earnings:           score -= 50
+            if score >= 55:
+                new_stocks.append({"symbol": symbol, "price": price, "score": score})
+                report.append(f"   🌟 {symbol} @ ${price:.2f} — Score: {score}")
+        except Exception:
+            continue
+
+    if not new_stocks:
+        report.append(f"   — No strong candidates found")
+
+    return [s["symbol"] for s in sorted(new_stocks, key=lambda x: x["score"], reverse=True)[:SCREENER_MAX]]
+
 # =============================================
-# EMAIL REPORT
+# EMAIL
 # =============================================
-def send_email(subject, report_lines):
+def send_email(subject, report_lines, is_error=False):
     try:
         if not EMAIL_ADDRESS or not EMAIL_PASSWORD:
-            print("⚠️ Email credentials not set — skipping email")
+            print("⚠️ Email credentials not set")
             return False
         body      = "\n".join(report_lines)
         msg       = MIMEMultipart("alternative")
@@ -316,58 +350,54 @@ def send_email(subject, report_lines):
         msg["From"]    = EMAIL_ADDRESS
         msg["To"]      = EMAIL_ADDRESS
         text_part = MIMEText(body, "plain")
+        color     = "#ff4444" if is_error else "#00ff00"
         html_body = f"""
-        <html>
-        <body style="font-family:monospace;background:#0a0a0a;color:#00ff00;padding:20px;">
+        <html><body style="font-family:monospace;background:#0a0a0a;color:{color};padding:20px;">
             <div style="max-width:600px;margin:0 auto;background:#111;padding:20px;
-                        border-radius:10px;border:1px solid #00ff00;">
-                <h2 style="color:#00ff00;">🤖 AI Trading Bot — Daily Report</h2>
-                <pre style="color:#00ff00;font-size:13px;line-height:1.6;">{body}</pre>
-                <hr style="border-color:#00ff00;">
-                <p style="color:#555;font-size:11px;">
-                    Sent automatically by your AI Trading Bot<br>
-                    Paper Trading — No real money at risk
-                </p>
+                        border-radius:10px;border:1px solid {color};">
+                <h2 style="color:{color};">🤖 AI Trading Bot</h2>
+                <pre style="color:{color};font-size:13px;line-height:1.6;">{body}</pre>
+                <hr style="border-color:{color};">
+                <p style="color:#555;font-size:11px;">Paper Trading — No real money at risk</p>
             </div>
-        </body>
-        </html>"""
+        </body></html>"""
         html_part = MIMEText(html_body, "html")
         msg.attach(text_part)
         msg.attach(html_part)
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
             server.sendmail(EMAIL_ADDRESS, EMAIL_ADDRESS, msg.as_string())
-        print(f"📧 Daily report sent to {EMAIL_ADDRESS}")
+        print(f"📧 Email sent!")
         return True
     except Exception as e:
         print(f"⚠️ Email failed: {e}")
         return False
 
 # =============================================
-# MAIN BOT — SAFETY RULE 2: Runs once exits
+# MAIN BOT
 # =============================================
 def run():
     now_et = datetime.now(ET)
     report = []
-    report.append(f"🤖 AI Trading Bot — Daily Report")
+    report.append(f"🤖 AI Trading Bot — Aggressive Intraday")
     report.append(f"📅 {now_et.strftime('%A %B %d, %Y')}")
-    report.append(f"⏰ Generated: {now_et.strftime('%I:%M %p')} ET")
-    report.append(f"💰 Weekly Budget: ${WEEKLY_BUDGET:,}")
-    report.append(f"👁 Core watchlist: {len(WATCHLIST)} stocks")
-    report.append(f"🧠 MA + RSI + Volume + News + Earnings + Screener")
+    report.append(f"⏰ {now_et.strftime('%I:%M %p')} ET")
+    report.append(f"💰 Budget: ${WEEKLY_BUDGET} | Stop: {STOP_LOSS*100}% | Target: {TAKE_PROFIT*100}%")
+    report.append(f"🧠 MA + RSI + Volume + Momentum + News + Earnings + Screener")
     report.append("="*45)
 
+    # Market hours check
     market_open, market_msg = is_market_open()
     report.append(f"🕐 {market_msg}")
 
     if not market_open:
-        report.append(f"🛑 Bot exiting — market is closed")
-        report.append(f"{'='*45}")
+        report.append(f"🛑 Market closed — bot exiting")
         print("\n".join(report))
         return
 
     report.append("="*45)
 
+    # Get account
     account = None
     profit  = 0
     try:
@@ -375,14 +405,16 @@ def run():
         portfolio = float(account["portfolio_value"])
         cash      = float(account["cash"])
         profit    = portfolio - 100000
-        report.append(f"💼 Portfolio Value: ${portfolio:,.2f}")
-        report.append(f"💵 Cash Available:  ${cash:,.2f}")
-        report.append(f"📈 Total P&L:       ${profit:+,.2f}")
+        report.append(f"💼 Portfolio: ${portfolio:,.2f}")
+        report.append(f"💵 Cash:      ${cash:,.2f}")
+        report.append(f"📈 P&L:       ${profit:+,.2f}")
     except Exception as e:
         report.append(f"⚠️ Account error: {e}")
         print("\n".join(report))
+        send_email(f"🚨 Bot Error — {now_et.strftime('%b %d %I:%M %p')} ET", report, is_error=True)
         return
 
+    # Get positions
     try:
         positions = get_positions()
         held      = {p["symbol"]: p for p in positions}
@@ -390,16 +422,27 @@ def run():
         report.append(f"⚠️ Positions error: {e}")
         held = {}
 
+    # End of day — close all positions
+    if is_end_of_day():
+        report.append(f"\n⏰ 3:30pm ET — Closing all positions for the day")
+        close_all_positions(report)
+        report.append(f"{'='*45}")
+        report.append(f"✅ End of day complete")
+        report.append(f"{'='*45}")
+        print("\n".join(report))
+        subject = f"📊 EOD Report — {now_et.strftime('%b %d')} | P&L: ${profit:+,.2f}"
+        send_email(subject, report)
+        return
+
     budget_per_stock = round(WEEKLY_BUDGET / MAX_POSITIONS, 2)
-    report.append(f"📊 Per position:    ${budget_per_stock:.2f}")
-    report.append(f"🛡 Min order:       ${MIN_ORDER:.2f}")
-    report.append(f"📅 Earnings buffer: {EARNINGS_SAFE_DAYS} days")
+    report.append(f"📊 Per position: ${budget_per_stock:.2f}")
     report.append("="*45)
 
+    # Run screener
     screener_stocks = screen_new_stocks(held, report)
     full_watchlist  = list(WATCHLIST) + screener_stocks
 
-    report.append(f"\n🔍 SCANNING {len(full_watchlist)} STOCKS ({len(WATCHLIST)} core + {len(screener_stocks)} screener)...\n")
+    report.append(f"\n🔍 SCANNING {len(full_watchlist)} STOCKS...\n")
 
     buy_signals  = []
     sell_signals = []
@@ -408,21 +451,15 @@ def run():
         try:
             a             = full_analysis(symbol)
             rsi_label     = "oversold 🟢" if a["rsi"] < RSI_OVERSOLD else "overbought 🔴" if a["rsi"] > RSI_OVERBOUGHT else "normal ⚪"
-            vol_label     = "✅ confirmed" if a["volume"] >= VOLUME_CONFIRM else "⚠️ low"
+            vol_label     = "✅" if a["volume"] >= VOLUME_CONFIRM else "⚠️ low"
             emoji         = "🟢" if a["signal"] == "BUY" else "🔴" if a["signal"] == "SELL" else "⏳"
             earnings_soon, e_msg = has_upcoming_earnings(symbol)
 
             if a["signal"] == "BUY" and earnings_soon:
                 a["signal"] = "HOLD"
-                report.append(f"   ⚠️ {symbol} @ ${a['price']:.2f} — BUY blocked: {e_msg}")
+                report.append(f"   ⚠️ {symbol} — BUY blocked: {e_msg}")
             else:
-                report.append(f"   {emoji} {symbol} @ ${a['price']:.2f}")
-                report.append(f"      Score: {a['score']}/100 | Signal: {a['signal']}")
-                report.append(f"      MA: {a['ma']} | RSI: {a['rsi']} ({rsi_label})")
-                report.append(f"      Volume: {a['volume']}x avg ({vol_label})")
-                report.append(f"      News: {a['news']} 📰")
-                report.append(f"      Earnings: {e_msg} 📅")
-                report.append("")
+                report.append(f"   {emoji} {symbol} @ ${a['price']:.2f} | Score: {a['score']}/100 | Mom: {a['momentum']:+.2f}%")
 
             if a["signal"] == "BUY" and symbol not in held:
                 buy_signals.append(a)
@@ -430,16 +467,18 @@ def run():
                 sell_signals.append(symbol)
 
         except Exception as e:
-            report.append(f"   ⚠️ {symbol}: Error — {e}")
+            report.append(f"   ⚠️ {symbol}: {e}")
 
-    report.append(f"{'='*45}")
-    report.append(f"📦 POSITION MANAGEMENT")
+    # Position management — tighter stops
+    report.append(f"\n{'='*45}")
+    report.append(f"📦 POSITIONS")
     report.append(f"{'='*45}")
 
     for symbol, pos in held.items():
         try:
             unrealized = float(pos["unrealized_pl"])
             gain_pct   = float(pos["unrealized_plpc"])
+
             if gain_pct >= TAKE_PROFIT:
                 result = place_fractional_order(symbol, float(pos["market_value"]), "sell")
                 if result:
@@ -453,6 +492,7 @@ def run():
         except Exception as e:
             report.append(f"   ⚠️ {symbol}: {e}")
 
+    # Sells
     report.append(f"\n{'='*45}")
     report.append(f"📤 SELLING")
     report.append(f"{'='*45}")
@@ -467,8 +507,9 @@ def run():
             except Exception as e:
                 report.append(f"   ⚠️ {symbol}: {e}")
     if sells == 0:
-        report.append(f"   — Nothing to sell this cycle")
+        report.append(f"   — Nothing to sell")
 
+    # Buys — ranked by score
     report.append(f"\n{'='*45}")
     report.append(f"📥 BUYING")
     report.append(f"{'='*45}")
@@ -480,47 +521,43 @@ def run():
             report.append(f"   ⛔ Max positions — skipping {symbol}")
             continue
         if cash < budget_per_stock:
-            report.append(f"   ⚠️ Not enough cash for {symbol}")
+            report.append(f"   ⚠️ Not enough cash")
             continue
         if budget_per_stock < MIN_ORDER:
-            report.append(f"   ⚠️ ${budget_per_stock:.2f} below minimum — skipping {symbol}")
             continue
         try:
             result = place_fractional_order(symbol, budget_per_stock, "buy")
             if result:
-                report.append(f"   📈 BOUGHT {symbol} @ ${signal['price']:.2f}")
-                report.append(f"   📈 ${budget_per_stock:.2f} | Score: {signal['score']}/100 | RSI: {signal['rsi']} | News: {signal['news']}")
+                report.append(f"   📈 BOUGHT {symbol} @ ${signal['price']:.2f} | Score: {signal['score']} | Mom: {signal['momentum']:+.2f}%")
                 cash -= budget_per_stock
                 buys += 1
         except Exception as e:
-            report.append(f"   ⚠️ Buy error {symbol}: {e}")
+            report.append(f"   ⚠️ {symbol}: {e}")
     if buys == 0:
-        report.append(f"   — No strong BUY signals this cycle")
+        report.append(f"   — No strong signals this cycle")
 
+    # Summary
     report.append(f"\n{'='*45}")
-    report.append(f"📊 END OF DAY SUMMARY")
+    report.append(f"📊 SUMMARY")
     report.append(f"{'='*45}")
-    report.append(f"   Core stocks:      {len(WATCHLIST)}")
-    report.append(f"   Screener finds:   {len(screener_stocks)}")
-    report.append(f"   Total scanned:    {len(full_watchlist)}")
-    report.append(f"   BUY signals:      {len(buy_signals)}")
-    report.append(f"   Buys executed:    {buys}")
-    report.append(f"   Sells executed:   {sells}")
-    report.append(f"   Positions held:   {len(held)}")
-    report.append(f"   Total P&L:        ${profit:+,.2f}")
+    report.append(f"   Scanned:  {len(full_watchlist)} stocks")
+    report.append(f"   Bought:   {buys}")
+    report.append(f"   Sold:     {sells}")
+    report.append(f"   Held:     {len(held)}")
+    report.append(f"   P&L:      ${profit:+,.2f}")
     report.append(f"{'='*45}")
-    report.append(f"✅ See you tomorrow!")
+    report.append(f"✅ Next run in 30 mins")
     report.append(f"{'='*45}")
 
     print("\n".join(report))
 
-    # Send ONE email during the 4pm ET hour
+    # Send email between 4pm - 5pm ET
     if now_et.hour == 16:
-        subject = f"📊 Daily Bot Report — {now_et.strftime('%b %d')} | P&L: ${profit:+,.2f} | Buys: {buys} Sells: {sells}"
+        subject = f"📊 Daily Report — {now_et.strftime('%b %d')} | P&L: ${profit:+,.2f} | Buys: {buys} Sells: {sells}"
         send_email(subject, report)
-        print(f"📧 End of day report sent!")
+        print(f"📧 Daily report sent!")
     else:
-        print(f"📧 No email this run — sends at 4pm ET (now {now_et.strftime('%I:%M %p')} ET)")
+        print(f"📧 No email — sends 4-5pm ET (now {now_et.strftime('%I:%M %p')} ET)")
 
-# SAFETY RULE 2 — Runs exactly once then exits
+# SAFETY RULE 2 — Runs once then exits
 run()
