@@ -24,21 +24,19 @@ EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")
 # =============================================
 # AGGRESSIVE INTRADAY SETTINGS
 # =============================================
-WEEKLY_BUDGET    = 100
-STOP_LOSS        = 0.01    # 1% stop loss — tighter protection
-TAKE_PROFIT      = 0.02    # 2% take profit — faster wins
-MAX_POSITIONS    = 3
-MIN_ORDER        = 1.00
-CLOSE_BY_HOUR   = 15       # Close all positions by 3:30pm ET
-CLOSE_BY_MINUTE = 30
+WEEKLY_BUDGET  = 100
+STOP_LOSS      = 0.01
+TAKE_PROFIT    = 0.02
+MAX_POSITIONS  = 3
+MIN_ORDER      = 1.00
 
-# RSI Settings — more aggressive
-RSI_PERIOD     = 10        # Shorter = more sensitive
-RSI_OVERBOUGHT = 65        # Lower threshold = sells sooner
-RSI_OVERSOLD   = 35        # Higher threshold = buys sooner
+# RSI Settings
+RSI_PERIOD     = 10
+RSI_OVERBOUGHT = 65
+RSI_OVERSOLD   = 35
 
 # Volume Settings
-VOLUME_CONFIRM = 1.5       # Higher volume confirmation required
+VOLUME_CONFIRM = 1.5
 
 # Earnings Safety
 EARNINGS_SAFE_DAYS = 5
@@ -48,6 +46,9 @@ SCREENER_MAX = 5
 
 # Timezone
 ET = ZoneInfo("America/New_York")
+
+# Early close dates (MM-DD format)
+EARLY_CLOSE_DATES = ["07-03", "07-04", "11-28", "12-24"]
 
 # =============================================
 # WATCHLIST
@@ -60,24 +61,47 @@ WATCHLIST = [
 ]
 
 # =============================================
-# SAFETY RULE 1 — MARKET HOURS (ET)
+# MARKET HOURS & TIMING
 # =============================================
+def is_early_close():
+    return datetime.now(ET).strftime("%m-%d") in EARLY_CLOSE_DATES
+
 def is_market_open():
     now_et  = datetime.now(ET)
     weekday = now_et.weekday()
     if weekday >= 5:
         return False, f"Market closed — {now_et.strftime('%A')} is a weekend"
     market_open  = now_et.replace(hour=9,  minute=0,  second=0, microsecond=0)
-    market_close = now_et.replace(hour=16, minute=30, second=0, microsecond=0)
+    if is_early_close():
+        market_close = now_et.replace(hour=13, minute=0, second=0, microsecond=0)
+    else:
+        market_close = now_et.replace(hour=16, minute=30, second=0, microsecond=0)
     if now_et < market_open:
         return False, f"Market not open yet — opens 9:00am ET (now {now_et.strftime('%I:%M %p')} ET)"
     if now_et > market_close:
-        return False, f"Market closed — closed 4:30pm ET (now {now_et.strftime('%I:%M %p')} ET)"
+        close_str = "1:00pm" if is_early_close() else "4:30pm"
+        return False, f"Market closed — closed {close_str} ET (now {now_et.strftime('%I:%M %p')} ET)"
     return True, f"Market OPEN — {now_et.strftime('%I:%M %p')} ET"
 
 def is_end_of_day():
     now_et = datetime.now(ET)
-    return (now_et.hour == CLOSE_BY_HOUR and now_et.minute >= CLOSE_BY_MINUTE) or now_et.hour > CLOSE_BY_HOUR
+    if is_early_close():
+        return (now_et.hour == 12 and now_et.minute >= 30) or now_et.hour > 12
+    else:
+        return (now_et.hour == 15 and now_et.minute >= 30) or now_et.hour > 15
+
+def should_send_email():
+    now_et = datetime.now(ET)
+    if is_early_close():
+        return now_et.hour == 13  # 1-2pm ET on early close days
+    else:
+        return now_et.hour == 16  # 4-5pm ET on normal days
+
+def email_window_str():
+    if is_early_close():
+        return "1-2pm ET (early close day)"
+    else:
+        return "4-5pm ET"
 
 # =============================================
 # ALPACA API
@@ -111,6 +135,24 @@ def place_fractional_order(symbol, dollars, side):
         "time_in_force": "day"
     })
 
+def close_position_safely(symbol, market_value, unrealized_pl):
+    """Close a position with error handling — fixes TSLA 403 error"""
+    try:
+        # Try fractional order first
+        result = place_fractional_order(symbol, float(market_value), "sell")
+        if result:
+            return True, float(unrealized_pl)
+    except Exception as e:
+        if "403" in str(e) or "Forbidden" in str(e):
+            try:
+                # Fallback — close by shares instead of dollars
+                pos = alpaca_request("DELETE", f"/v2/positions/{symbol}")
+                return True, float(unrealized_pl)
+            except Exception as e2:
+                return False, 0
+        return False, 0
+    return False, 0
+
 def close_all_positions(report):
     report.append(f"\n🔔 END OF DAY — Closing all positions")
     try:
@@ -123,11 +165,14 @@ def close_all_positions(report):
             symbol     = pos["symbol"]
             market_val = float(pos["market_value"])
             pl         = float(pos["unrealized_pl"])
-            result     = place_fractional_order(symbol, market_val, "sell")
-            if result:
-                total_pl += pl
-                emoji = "💰" if pl >= 0 else "🛑"
-                report.append(f"   {emoji} Closed {symbol}: P&L ${pl:+.2f}")
+            success, closed_pl = close_position_safely(
+                symbol, market_val, pl)
+            if success:
+                total_pl += closed_pl
+                emoji = "💰" if closed_pl >= 0 else "🛑"
+                report.append(f"   {emoji} Closed {symbol}: P&L ${closed_pl:+.2f}")
+            else:
+                report.append(f"   ⚠️ Could not close {symbol} — check Alpaca manually")
         report.append(f"   📊 Total closed P&L: ${total_pl:+.2f}")
         return total_pl
     except Exception as e:
@@ -149,24 +194,20 @@ def get_stock_data(symbol):
     return closes, volumes
 
 # =============================================
-# TECHNICAL INDICATORS — AGGRESSIVE VERSION
+# TECHNICAL INDICATORS
 # =============================================
 def get_ma_signal(prices):
     df = pd.DataFrame(prices, columns=["close"])
     df["short"] = df["close"].rolling(5).mean()
     df["long"]  = df["close"].rolling(15).mean()
-    df["mom"]   = df["close"].pct_change(3)  # 3-day momentum
+    df["mom"]   = df["close"].pct_change(3)
     l = df.iloc[-1]
     p = df.iloc[-2]
     strength = ((l["short"] - l["long"]) / l["long"]) * 100
-
-    # Buy signal — MA crossover + positive momentum
     if p["short"] <= p["long"] and l["short"] > l["long"] and l["mom"] > 0:
         return "BUY", round(strength, 4)
-    # Sell signal — MA crossover + negative momentum
     elif p["short"] >= p["long"] and l["short"] < l["long"] and l["mom"] < 0:
         return "SELL", round(strength, 4)
-    # Strong momentum buy even without crossover
     elif l["mom"] > 0.02 and l["short"] > l["long"]:
         return "BUY", round(strength, 4)
     return "HOLD", round(strength, 4)
@@ -193,11 +234,10 @@ def get_volume_signal(volumes):
 def get_momentum_score(prices):
     if len(prices) < 10:
         return 0
-    day1  = (prices[-1] - prices[-2])  / prices[-2] * 100
-    day3  = (prices[-1] - prices[-4])  / prices[-4] * 100
-    day5  = (prices[-1] - prices[-6])  / prices[-6] * 100
-    score = (day1 * 0.5) + (day3 * 0.3) + (day5 * 0.2)
-    return round(score, 4)
+    day1  = (prices[-1] - prices[-2]) / prices[-2] * 100
+    day3  = (prices[-1] - prices[-4]) / prices[-4] * 100
+    day5  = (prices[-1] - prices[-6]) / prices[-6] * 100
+    return round((day1 * 0.5) + (day3 * 0.3) + (day5 * 0.2), 4)
 
 def has_upcoming_earnings(symbol):
     try:
@@ -209,7 +249,7 @@ def has_upcoming_earnings(symbol):
         earnings = events.get("calendarEvents", {}).get("earnings", {})
         dates    = earnings.get("earningsDate", [])
         if not dates:
-            return False, "No earnings date"
+            return False, "Clear"
         now_et    = datetime.now(ET)
         safe_date = now_et + timedelta(days=EARNINGS_SAFE_DAYS)
         for d in dates:
@@ -231,50 +271,38 @@ def get_news_sentiment(symbol):
         content_lower = content.lower()
         pos_count = sum(content_lower.count(w) for w in positive_words)
         neg_count = sum(content_lower.count(w) for w in negative_words)
-        if pos_count > neg_count * 1.5:   return "POSITIVE", pos_count, neg_count
-        elif neg_count > pos_count * 1.5: return "NEGATIVE", pos_count, neg_count
-        return "NEUTRAL", pos_count, neg_count
+        if pos_count > neg_count * 1.5:   return "POSITIVE"
+        elif neg_count > pos_count * 1.5: return "NEGATIVE"
+        return "NEUTRAL"
     except Exception:
-        return "NEUTRAL", 0, 0
+        return "NEUTRAL"
 
 def full_analysis(symbol):
     prices, volumes          = get_stock_data(symbol)
     ma_signal, strength      = get_ma_signal(prices)
     rsi                      = get_rsi(prices)
     vol_confirmed, vol_ratio = get_volume_signal(volumes)
-    news_sentiment, pos, neg = get_news_sentiment(symbol)
+    news                     = get_news_sentiment(symbol)
     momentum                 = get_momentum_score(prices)
     price                    = prices[-1]
-
     score = 0
-    # MA Signal (35 points)
-    if ma_signal == "BUY":        score += 35
-    elif ma_signal == "SELL":     score -= 35
-
-    # RSI (25 points) — more aggressive thresholds
-    if rsi < RSI_OVERSOLD:        score += 25
-    elif rsi < 45:                score += 12
-    elif rsi > RSI_OVERBOUGHT:    score -= 25
-    else:                         score += 5
-
-    # Volume (20 points)
-    if vol_confirmed:             score += 20
-    else:                         score += 3
-
-    # Momentum (15 points) — NEW
-    if momentum > 1.0:            score += 15
-    elif momentum > 0.5:          score += 8
-    elif momentum < -1.0:         score -= 15
-    elif momentum < -0.5:         score -= 8
-
-    # News (5 points)
-    if news_sentiment == "POSITIVE":   score += 5
-    elif news_sentiment == "NEGATIVE": score -= 5
-
+    if ma_signal == "BUY":      score += 35
+    elif ma_signal == "SELL":   score -= 35
+    if rsi < RSI_OVERSOLD:      score += 25
+    elif rsi < 45:              score += 12
+    elif rsi > RSI_OVERBOUGHT:  score -= 25
+    else:                       score += 5
+    if vol_confirmed:           score += 20
+    else:                       score += 3
+    if momentum > 1.0:          score += 15
+    elif momentum > 0.5:        score += 8
+    elif momentum < -1.0:       score -= 15
+    elif momentum < -0.5:       score -= 8
+    if news == "POSITIVE":      score += 5
+    elif news == "NEGATIVE":    score -= 5
     if score >= 55:    final_signal = "BUY"
     elif score <= -20: final_signal = "SELL"
     else:              final_signal = "HOLD"
-
     return {
         "symbol":   symbol,
         "price":    price,
@@ -283,16 +311,14 @@ def full_analysis(symbol):
         "ma":       ma_signal,
         "rsi":      rsi,
         "volume":   vol_ratio,
-        "news":     news_sentiment,
+        "news":     news,
         "momentum": momentum,
-        "strength": strength,
     }
 
 def screen_new_stocks(held, report):
-    report.append(f"\n🔭 SCREENER — Finding Opportunities")
+    report.append(f"\n🔭 SCREENER")
     report.append(f"{'='*45}")
     candidates = set()
-
     for scrId in ["day_gainers", "most_actives"]:
         try:
             url = f"https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds={scrId}&count=10"
@@ -304,10 +330,9 @@ def screen_new_stocks(held, report):
                 sym = q.get("symbol", "")
                 if sym and sym not in WATCHLIST and sym not in held:
                     candidates.add(sym)
-            report.append(f"   📊 {scrId}: {len(quotes)} stocks found")
+            report.append(f"   📊 {scrId}: {len(quotes)} found")
         except Exception as e:
             report.append(f"   ⚠️ {scrId}: {e}")
-
     new_stocks = []
     for symbol in list(candidates)[:10]:
         try:
@@ -315,9 +340,9 @@ def screen_new_stocks(held, report):
             if len(prices) < 20: continue
             ma_signal, _         = get_ma_signal(prices)
             rsi                  = get_rsi(prices)
-            vol_confirmed, ratio = get_volume_signal(volumes)
+            vol_confirmed, _     = get_volume_signal(volumes)
             momentum             = get_momentum_score(prices)
-            earnings, e_msg      = has_upcoming_earnings(symbol)
+            earnings, _          = has_upcoming_earnings(symbol)
             price                = prices[-1]
             score = 0
             if ma_signal == "BUY": score += 35
@@ -330,10 +355,8 @@ def screen_new_stocks(held, report):
                 report.append(f"   🌟 {symbol} @ ${price:.2f} — Score: {score}")
         except Exception:
             continue
-
     if not new_stocks:
-        report.append(f"   — No strong candidates found")
-
+        report.append(f"   — No strong candidates")
     return [s["symbol"] for s in sorted(new_stocks, key=lambda x: x["score"], reverse=True)[:SCREENER_MAX]]
 
 # =============================================
@@ -349,7 +372,6 @@ def send_email(subject, report_lines, is_error=False):
         msg["Subject"] = subject
         msg["From"]    = EMAIL_ADDRESS
         msg["To"]      = EMAIL_ADDRESS
-        text_part = MIMEText(body, "plain")
         color     = "#ff4444" if is_error else "#00ff00"
         html_body = f"""
         <html><body style="font-family:monospace;background:#0a0a0a;color:{color};padding:20px;">
@@ -361,9 +383,8 @@ def send_email(subject, report_lines, is_error=False):
                 <p style="color:#555;font-size:11px;">Paper Trading — No real money at risk</p>
             </div>
         </body></html>"""
-        html_part = MIMEText(html_body, "html")
-        msg.attach(text_part)
-        msg.attach(html_part)
+        msg.attach(MIMEText(body, "plain"))
+        msg.attach(MIMEText(html_body, "html"))
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
             server.sendmail(EMAIL_ADDRESS, EMAIL_ADDRESS, msg.as_string())
@@ -377,11 +398,13 @@ def send_email(subject, report_lines, is_error=False):
 # MAIN BOT
 # =============================================
 def run():
-    now_et = datetime.now(ET)
-    report = []
+    now_et     = datetime.now(ET)
+    early_close = is_early_close()
+    report     = []
     report.append(f"🤖 AI Trading Bot — Aggressive Intraday")
     report.append(f"📅 {now_et.strftime('%A %B %d, %Y')}")
     report.append(f"⏰ {now_et.strftime('%I:%M %p')} ET")
+    report.append(f"{'⚠️ EARLY CLOSE DAY — Market closes 1pm ET' if early_close else '📅 Regular trading day'}")
     report.append(f"💰 Budget: ${WEEKLY_BUDGET} | Stop: {STOP_LOSS*100}% | Target: {TAKE_PROFIT*100}%")
     report.append(f"🧠 MA + RSI + Volume + Momentum + News + Earnings + Screener")
     report.append("="*45)
@@ -411,7 +434,9 @@ def run():
     except Exception as e:
         report.append(f"⚠️ Account error: {e}")
         print("\n".join(report))
-        send_email(f"🚨 Bot Error — {now_et.strftime('%b %d %I:%M %p')} ET", report, is_error=True)
+        send_email(
+            f"🚨 Bot Error — {now_et.strftime('%b %d %I:%M %p')} ET",
+            report, is_error=True)
         return
 
     # Get positions
@@ -424,7 +449,8 @@ def run():
 
     # End of day — close all positions
     if is_end_of_day():
-        report.append(f"\n⏰ 3:30pm ET — Closing all positions for the day")
+        close_time = "12:30pm" if early_close else "3:30pm"
+        report.append(f"\n⏰ {close_time} ET — Closing all positions")
         close_all_positions(report)
         report.append(f"{'='*45}")
         report.append(f"✅ End of day complete")
@@ -438,10 +464,9 @@ def run():
     report.append(f"📊 Per position: ${budget_per_stock:.2f}")
     report.append("="*45)
 
-    # Run screener
+    # Screener
     screener_stocks = screen_new_stocks(held, report)
     full_watchlist  = list(WATCHLIST) + screener_stocks
-
     report.append(f"\n🔍 SCANNING {len(full_watchlist)} STOCKS...\n")
 
     buy_signals  = []
@@ -450,8 +475,6 @@ def run():
     for symbol in full_watchlist:
         try:
             a             = full_analysis(symbol)
-            rsi_label     = "oversold 🟢" if a["rsi"] < RSI_OVERSOLD else "overbought 🔴" if a["rsi"] > RSI_OVERBOUGHT else "normal ⚪"
-            vol_label     = "✅" if a["volume"] >= VOLUME_CONFIRM else "⚠️ low"
             emoji         = "🟢" if a["signal"] == "BUY" else "🔴" if a["signal"] == "SELL" else "⏳"
             earnings_soon, e_msg = has_upcoming_earnings(symbol)
 
@@ -465,11 +488,10 @@ def run():
                 buy_signals.append(a)
             elif a["signal"] == "SELL" and symbol in held:
                 sell_signals.append(symbol)
-
         except Exception as e:
             report.append(f"   ⚠️ {symbol}: {e}")
 
-    # Position management — tighter stops
+    # Position management with safe close
     report.append(f"\n{'='*45}")
     report.append(f"📦 POSITIONS")
     report.append(f"{'='*45}")
@@ -480,13 +502,20 @@ def run():
             gain_pct   = float(pos["unrealized_plpc"])
 
             if gain_pct >= TAKE_PROFIT:
-                result = place_fractional_order(symbol, float(pos["market_value"]), "sell")
-                if result:
+                success, pl = close_position_safely(
+                    symbol, pos["market_value"], unrealized)
+                if success:
                     report.append(f"   💰 TAKE PROFIT {symbol}: +${unrealized:.2f} ({gain_pct*100:+.2f}%)")
+                else:
+                    report.append(f"   ⚠️ {symbol}: Could not close — check Alpaca")
+
             elif gain_pct <= -STOP_LOSS:
-                result = place_fractional_order(symbol, float(pos["market_value"]), "sell")
-                if result:
+                success, pl = close_position_safely(
+                    symbol, pos["market_value"], unrealized)
+                if success:
                     report.append(f"   🛑 STOP LOSS {symbol}: ${unrealized:.2f} ({gain_pct*100:+.2f}%)")
+                else:
+                    report.append(f"   ⚠️ {symbol}: Could not close — check Alpaca")
             else:
                 report.append(f"   📦 {symbol}: ${unrealized:+.2f} ({gain_pct*100:+.2f}%) — holding")
         except Exception as e:
@@ -500,16 +529,20 @@ def run():
     for symbol in sell_signals:
         if symbol in held:
             try:
-                result = place_fractional_order(symbol, float(held[symbol]["market_value"]), "sell")
-                if result:
+                success, pl = close_position_safely(
+                    symbol, held[symbol]["market_value"],
+                    held[symbol]["unrealized_pl"])
+                if success:
                     report.append(f"   🔴 SOLD {symbol}")
                     sells += 1
+                else:
+                    report.append(f"   ⚠️ Could not sell {symbol}")
             except Exception as e:
                 report.append(f"   ⚠️ {symbol}: {e}")
     if sells == 0:
         report.append(f"   — Nothing to sell")
 
-    # Buys — ranked by score
+    # Buys
     report.append(f"\n{'='*45}")
     report.append(f"📥 BUYING")
     report.append(f"{'='*45}")
@@ -518,7 +551,7 @@ def run():
     for signal in buy_signals:
         symbol = signal["symbol"]
         if len(held) + buys >= MAX_POSITIONS:
-            report.append(f"   ⛔ Max positions — skipping {symbol}")
+            report.append(f"   ⛔ Max positions — skipping {signal['symbol']}")
             continue
         if cash < budget_per_stock:
             report.append(f"   ⚠️ Not enough cash")
@@ -551,13 +584,13 @@ def run():
 
     print("\n".join(report))
 
-    # Send email between 4pm - 5pm ET
-    if now_et.hour == 16:
+    # Send email at market close window
+    if should_send_email():
         subject = f"📊 Daily Report — {now_et.strftime('%b %d')} | P&L: ${profit:+,.2f} | Buys: {buys} Sells: {sells}"
         send_email(subject, report)
         print(f"📧 Daily report sent!")
     else:
-        print(f"📧 No email — sends 4-5pm ET (now {now_et.strftime('%I:%M %p')} ET)")
+        print(f"📧 No email — sends {email_window_str()} (now {now_et.strftime('%I:%M %p')} ET)")
 
 # SAFETY RULE 2 — Runs once then exits
 run()
