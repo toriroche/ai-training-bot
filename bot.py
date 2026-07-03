@@ -47,7 +47,7 @@ SCREENER_MAX = 5
 # Timezone
 ET = ZoneInfo("America/New_York")
 
-# Early close dates (MM-DD format)
+# Early close dates MM-DD
 EARLY_CLOSE_DATES = ["07-03", "07-04", "11-28", "12-24"]
 
 # =============================================
@@ -61,47 +61,55 @@ WATCHLIST = [
 ]
 
 # =============================================
-# MARKET HOURS & TIMING
+# MARKET TIMING
 # =============================================
 def is_early_close():
     return datetime.now(ET).strftime("%m-%d") in EARLY_CLOSE_DATES
 
+def get_market_close_time():
+    now_et = datetime.now(ET)
+    if is_early_close():
+        return now_et.replace(hour=13, minute=0, second=0, microsecond=0)
+    else:
+        return now_et.replace(hour=16, minute=30, second=0, microsecond=0)
+
 def is_market_open():
-    now_et  = datetime.now(ET)
-    weekday = now_et.weekday()
+    now_et       = datetime.now(ET)
+    weekday      = now_et.weekday()
     if weekday >= 5:
         return False, f"Market closed — {now_et.strftime('%A')} is a weekend"
-    market_open  = now_et.replace(hour=9,  minute=0,  second=0, microsecond=0)
-    if is_early_close():
-        market_close = now_et.replace(hour=13, minute=0, second=0, microsecond=0)
-    else:
-        market_close = now_et.replace(hour=16, minute=30, second=0, microsecond=0)
+    market_open  = now_et.replace(hour=9,  minute=0, second=0, microsecond=0)
+    market_close = get_market_close_time()
     if now_et < market_open:
         return False, f"Market not open yet — opens 9:00am ET (now {now_et.strftime('%I:%M %p')} ET)"
-    if now_et > market_close:
+    if now_et >= market_close:
         close_str = "1:00pm" if is_early_close() else "4:30pm"
         return False, f"Market closed — closed {close_str} ET (now {now_et.strftime('%I:%M %p')} ET)"
     return True, f"Market OPEN — {now_et.strftime('%I:%M %p')} ET"
 
 def is_end_of_day():
-    now_et = datetime.now(ET)
-    if is_early_close():
-        return (now_et.hour == 12 and now_et.minute >= 30) or now_et.hour > 12
-    else:
-        return (now_et.hour == 15 and now_et.minute >= 30) or now_et.hour > 15
+    now_et       = datetime.now(ET)
+    market_close = get_market_close_time()
+    close_30min  = market_close - timedelta(minutes=30)
+    return now_et >= close_30min
 
-def should_send_email():
-    now_et = datetime.now(ET)
-    if is_early_close():
-        return now_et.hour == 13  # 1-2pm ET on early close days
-    else:
-        return now_et.hour == 16  # 4-5pm ET on normal days
+def already_sent_today():
+    """Check if we already sent the end of day email today"""
+    props_file = "/home/ubuntu/.bot_sent"
+    today      = datetime.now(ET).strftime("%Y-%m-%d")
+    try:
+        with open(props_file, "r") as f:
+            last_sent = f.read().strip()
+        return last_sent == today
+    except Exception:
+        return False
 
-def email_window_str():
-    if is_early_close():
-        return "1-2pm ET (early close day)"
-    else:
-        return "4-5pm ET"
+def mark_sent_today():
+    """Mark that we sent the email today"""
+    props_file = "/home/ubuntu/.bot_sent"
+    today      = datetime.now(ET).strftime("%Y-%m-%d")
+    with open(props_file, "w") as f:
+        f.write(today)
 
 # =============================================
 # ALPACA API
@@ -136,25 +144,21 @@ def place_fractional_order(symbol, dollars, side):
     })
 
 def close_position_safely(symbol, market_value, unrealized_pl):
-    """Close a position with error handling — fixes TSLA 403 error"""
     try:
-        # Try fractional order first
         result = place_fractional_order(symbol, float(market_value), "sell")
         if result:
             return True, float(unrealized_pl)
     except Exception as e:
         if "403" in str(e) or "Forbidden" in str(e):
             try:
-                # Fallback — close by shares instead of dollars
-                pos = alpaca_request("DELETE", f"/v2/positions/{symbol}")
+                alpaca_request("DELETE", f"/v2/positions/{symbol}")
                 return True, float(unrealized_pl)
-            except Exception as e2:
+            except Exception:
                 return False, 0
-        return False, 0
     return False, 0
 
 def close_all_positions(report):
-    report.append(f"\n🔔 END OF DAY — Closing all positions")
+    report.append(f"\n🔔 Closing all positions for the day")
     try:
         positions = get_positions()
         if not positions:
@@ -165,8 +169,7 @@ def close_all_positions(report):
             symbol     = pos["symbol"]
             market_val = float(pos["market_value"])
             pl         = float(pos["unrealized_pl"])
-            success, closed_pl = close_position_safely(
-                symbol, market_val, pl)
+            success, closed_pl = close_position_safely(symbol, market_val, pl)
             if success:
                 total_pl += closed_pl
                 emoji = "💰" if closed_pl >= 0 else "🛑"
@@ -234,9 +237,9 @@ def get_volume_signal(volumes):
 def get_momentum_score(prices):
     if len(prices) < 10:
         return 0
-    day1  = (prices[-1] - prices[-2]) / prices[-2] * 100
-    day3  = (prices[-1] - prices[-4]) / prices[-4] * 100
-    day5  = (prices[-1] - prices[-6]) / prices[-6] * 100
+    day1 = (prices[-1] - prices[-2]) / prices[-2] * 100
+    day3 = (prices[-1] - prices[-4]) / prices[-4] * 100
+    day5 = (prices[-1] - prices[-6]) / prices[-6] * 100
     return round((day1 * 0.5) + (day3 * 0.3) + (day5 * 0.2), 4)
 
 def has_upcoming_earnings(symbol):
@@ -336,14 +339,14 @@ def screen_new_stocks(held, report):
     new_stocks = []
     for symbol in list(candidates)[:10]:
         try:
-            prices, volumes      = get_stock_data(symbol)
+            prices, volumes  = get_stock_data(symbol)
             if len(prices) < 20: continue
-            ma_signal, _         = get_ma_signal(prices)
-            rsi                  = get_rsi(prices)
-            vol_confirmed, _     = get_volume_signal(volumes)
-            momentum             = get_momentum_score(prices)
-            earnings, _          = has_upcoming_earnings(symbol)
-            price                = prices[-1]
+            ma_signal, _     = get_ma_signal(prices)
+            rsi              = get_rsi(prices)
+            vol_confirmed, _ = get_volume_signal(volumes)
+            momentum         = get_momentum_score(prices)
+            earnings, _      = has_upcoming_earnings(symbol)
+            price            = prices[-1]
             score = 0
             if ma_signal == "BUY": score += 35
             if rsi < RSI_OVERSOLD: score += 25
@@ -367,13 +370,13 @@ def send_email(subject, report_lines, is_error=False):
         if not EMAIL_ADDRESS or not EMAIL_PASSWORD:
             print("⚠️ Email credentials not set")
             return False
-        body      = "\n".join(report_lines)
-        msg       = MIMEMultipart("alternative")
+        body  = "\n".join(report_lines)
+        msg   = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"]    = EMAIL_ADDRESS
         msg["To"]      = EMAIL_ADDRESS
-        color     = "#ff4444" if is_error else "#00ff00"
-        html_body = f"""
+        color = "#ff4444" if is_error else "#00ff00"
+        html  = f"""
         <html><body style="font-family:monospace;background:#0a0a0a;color:{color};padding:20px;">
             <div style="max-width:600px;margin:0 auto;background:#111;padding:20px;
                         border-radius:10px;border:1px solid {color};">
@@ -384,7 +387,7 @@ def send_email(subject, report_lines, is_error=False):
             </div>
         </body></html>"""
         msg.attach(MIMEText(body, "plain"))
-        msg.attach(MIMEText(html_body, "html"))
+        msg.attach(MIMEText(html, "html"))
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
             server.sendmail(EMAIL_ADDRESS, EMAIL_ADDRESS, msg.as_string())
@@ -398,26 +401,61 @@ def send_email(subject, report_lines, is_error=False):
 # MAIN BOT
 # =============================================
 def run():
-    now_et     = datetime.now(ET)
+    now_et      = datetime.now(ET)
     early_close = is_early_close()
-    report     = []
+    weekday     = now_et.weekday()
+    report      = []
+
     report.append(f"🤖 AI Trading Bot — Aggressive Intraday")
     report.append(f"📅 {now_et.strftime('%A %B %d, %Y')}")
     report.append(f"⏰ {now_et.strftime('%I:%M %p')} ET")
-    report.append(f"{'⚠️ EARLY CLOSE DAY — Market closes 1pm ET' if early_close else '📅 Regular trading day'}")
+    report.append(f"{'⚠️ EARLY CLOSE — Market closes 1pm ET' if early_close else '📅 Regular trading day'}")
     report.append(f"💰 Budget: ${WEEKLY_BUDGET} | Stop: {STOP_LOSS*100}% | Target: {TAKE_PROFIT*100}%")
     report.append(f"🧠 MA + RSI + Volume + Momentum + News + Earnings + Screener")
     report.append("="*45)
 
-    # Market hours check
+    # Weekend — just exit silently no email
+    if weekday >= 5:
+        print(f"Weekend — bot sleeping")
+        return
+
     market_open, market_msg = is_market_open()
     report.append(f"🕐 {market_msg}")
 
-    if not market_open:
-        report.append(f"🛑 Market closed — bot exiting")
+    # ── MARKET IS CLOSED ────────────────────
+    # Send end of day email ONCE after close
+    if not market_open and now_et.hour >= 9:
+        if already_sent_today():
+            print(f"📧 End of day email already sent today — skipping")
+            return
+
+        # Get account for P&L
+        profit    = 0
+        portfolio = 100000
+        try:
+            account   = get_account()
+            portfolio = float(account["portfolio_value"])
+            cash      = float(account["cash"])
+            profit    = portfolio - 100000
+            report.append(f"💼 Portfolio: ${portfolio:,.2f}")
+            report.append(f"💵 Cash:      ${cash:,.2f}")
+            report.append(f"📈 P&L:       ${profit:+,.2f}")
+        except Exception as e:
+            report.append(f"⚠️ Account error: {e}")
+
+        report.append(f"{'='*45}")
+        report.append(f"✅ Market closed — end of day report")
+        report.append(f"{'='*45}")
+
         print("\n".join(report))
+
+        subject = f"📊 Daily Report — {now_et.strftime('%b %d')} | P&L: ${profit:+,.2f}"
+        if send_email(subject, report):
+            mark_sent_today()
+            print(f"📧 End of day email sent and logged!")
         return
 
+    # ── MARKET IS OPEN ───────────────────────
     report.append("="*45)
 
     # Get account
@@ -447,17 +485,15 @@ def run():
         report.append(f"⚠️ Positions error: {e}")
         held = {}
 
-    # End of day — close all positions
+    # End of day — close all 30 mins before close
     if is_end_of_day():
         close_time = "12:30pm" if early_close else "3:30pm"
         report.append(f"\n⏰ {close_time} ET — Closing all positions")
         close_all_positions(report)
         report.append(f"{'='*45}")
-        report.append(f"✅ End of day complete")
+        report.append(f"✅ Positions closed — awaiting market close for report")
         report.append(f"{'='*45}")
         print("\n".join(report))
-        subject = f"📊 EOD Report — {now_et.strftime('%b %d')} | P&L: ${profit:+,.2f}"
-        send_email(subject, report)
         return
 
     budget_per_stock = round(WEEKLY_BUDGET / MAX_POSITIONS, 2)
@@ -477,13 +513,11 @@ def run():
             a             = full_analysis(symbol)
             emoji         = "🟢" if a["signal"] == "BUY" else "🔴" if a["signal"] == "SELL" else "⏳"
             earnings_soon, e_msg = has_upcoming_earnings(symbol)
-
             if a["signal"] == "BUY" and earnings_soon:
                 a["signal"] = "HOLD"
                 report.append(f"   ⚠️ {symbol} — BUY blocked: {e_msg}")
             else:
                 report.append(f"   {emoji} {symbol} @ ${a['price']:.2f} | Score: {a['score']}/100 | Mom: {a['momentum']:+.2f}%")
-
             if a["signal"] == "BUY" and symbol not in held:
                 buy_signals.append(a)
             elif a["signal"] == "SELL" and symbol in held:
@@ -491,7 +525,7 @@ def run():
         except Exception as e:
             report.append(f"   ⚠️ {symbol}: {e}")
 
-    # Position management with safe close
+    # Position management
     report.append(f"\n{'='*45}")
     report.append(f"📦 POSITIONS")
     report.append(f"{'='*45}")
@@ -500,18 +534,14 @@ def run():
         try:
             unrealized = float(pos["unrealized_pl"])
             gain_pct   = float(pos["unrealized_plpc"])
-
             if gain_pct >= TAKE_PROFIT:
-                success, pl = close_position_safely(
-                    symbol, pos["market_value"], unrealized)
+                success, pl = close_position_safely(symbol, pos["market_value"], unrealized)
                 if success:
                     report.append(f"   💰 TAKE PROFIT {symbol}: +${unrealized:.2f} ({gain_pct*100:+.2f}%)")
                 else:
                     report.append(f"   ⚠️ {symbol}: Could not close — check Alpaca")
-
             elif gain_pct <= -STOP_LOSS:
-                success, pl = close_position_safely(
-                    symbol, pos["market_value"], unrealized)
+                success, pl = close_position_safely(symbol, pos["market_value"], unrealized)
                 if success:
                     report.append(f"   🛑 STOP LOSS {symbol}: ${unrealized:.2f} ({gain_pct*100:+.2f}%)")
                 else:
@@ -551,7 +581,7 @@ def run():
     for signal in buy_signals:
         symbol = signal["symbol"]
         if len(held) + buys >= MAX_POSITIONS:
-            report.append(f"   ⛔ Max positions — skipping {signal['symbol']}")
+            report.append(f"   ⛔ Max positions — skipping {symbol}")
             continue
         if cash < budget_per_stock:
             report.append(f"   ⚠️ Not enough cash")
@@ -583,14 +613,6 @@ def run():
     report.append(f"{'='*45}")
 
     print("\n".join(report))
-
-    # Send email at market close window
-    if should_send_email():
-        subject = f"📊 Daily Report — {now_et.strftime('%b %d')} | P&L: ${profit:+,.2f} | Buys: {buys} Sells: {sells}"
-        send_email(subject, report)
-        print(f"📧 Daily report sent!")
-    else:
-        print(f"📧 No email — sends {email_window_str()} (now {now_et.strftime('%I:%M %p')} ET)")
 
 # SAFETY RULE 2 — Runs once then exits
 run()
