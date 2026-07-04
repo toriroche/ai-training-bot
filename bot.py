@@ -374,12 +374,12 @@ def has_upcoming_earnings_yahoo(symbol):
     except Exception:
         return False, "Unknown"
 
-# Finnhub — Market news for overnight
+# Finnhub — Market news (financial only, used internally not emailed)
 def get_market_news():
     if not can_call("finnhub") or not FINNHUB_KEY:
         return []
     try:
-        url = f"https://finnhub.io/api/v1/news?category=general&token={FINNHUB_KEY}"
+        url = f"https://finnhub.io/api/v1/news?category=merger&token={FINNHUB_KEY}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=10) as r:
             articles = json.loads(r.read())
@@ -758,22 +758,15 @@ def run():
     weekday     = now_et.weekday()
     early_close = is_early_close()
 
-    # ── WEEKEND ──────────────────────────────
+    # ── WEEKEND — silent intel gathering, NO emails ──
     if weekday >= 5:
-        print(f"Weekend — running research mode")
-        send_weekend_research()
+        print(f"Weekend — bot monitoring silently. No email until weekday close.")
+        get_weekly_earnings()  # Gather data silently
         return
 
-    # ── PRE-MARKET 8:30am ────────────────────
-    if is_pre_market():
-        print(f"Pre-market — sending briefing")
-        send_premarket_briefing()
-        return
-
-    # ── MIDNIGHT OVERNIGHT ───────────────────
+    # ── OVERNIGHT WEEKDAY — silent monitoring ──
     if is_overnight():
-        print(f"Overnight — checking news")
-        send_overnight_update()
+        print(f"Overnight — bot monitoring silently")
         return
 
     # ── MARKET IS CLOSED (after hours) ───────
