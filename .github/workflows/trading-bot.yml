@@ -1,30 +1,28 @@
 name: AI Trading Bot
 
 on:
-  schedule:
-    - cron: '*/30 * * * *'
-  workflow_dispatch:
+  workflow_dispatch:  # Manual trigger only — Oracle cron handles scheduling
 
 jobs:
-  run-bot:
+  trade:
     runs-on: ubuntu-latest
-    
     steps:
-      - name: Get the code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v3
       
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
-      
-      - name: Install libraries
-        run: pip install -r requirements.txt
-      
-      - name: Run the trading bot
+          python-version: '3.11'
+          
+      - name: Install dependencies
+        run: pip install pandas pytz
+        
+      - name: Run Trading Bot
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          ALPHA_VANTAGE_API_KEY: ${{ secrets.ALPHA_VANTAGE_API_KEY }}
         run: python bot.py
