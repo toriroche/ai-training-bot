@@ -25,23 +25,23 @@ ALPHA_VANTAGE_KEY  = os.environ.get("ALPHA_VANTAGE_API_KEY")
 # SETTINGS
 # =============================================
 WEEKLY_BUDGET      = 100
-STOP_LOSS          = 0.01
-TAKE_PROFIT        = 0.02
-MAX_POSITIONS      = 3
+STOP_LOSS          = 0.005   # 0.5% — tighter stop
+TAKE_PROFIT        = 0.01    # 1% — faster wins
+MAX_POSITIONS      = 6
 MIN_ORDER          = 1.00
 RSI_PERIOD         = 10
-RSI_OVERBOUGHT     = 65
-RSI_OVERSOLD       = 35
-VOLUME_CONFIRM     = 1.5
+RSI_OVERBOUGHT     = 60      # More aggressive
+RSI_OVERSOLD       = 40      # More aggressive
+VOLUME_CONFIRM     = 1.2     # Less strict
 EARNINGS_SAFE_DAYS = 5
 SCREENER_MAX       = 5
 ET                 = ZoneInfo("America/New_York")
 EARLY_CLOSE_DATES  = ["07-03", "07-04", "11-28", "12-24"]
 
 # Rate limiting — max calls per day
-YAHOO_MAX_CALLS    = 100
-FINNHUB_MAX_CALLS  = 50
-ALPHA_MAX_CALLS    = 20
+YAHOO_MAX_CALLS    = 500
+FINNHUB_MAX_CALLS  = 200
+ALPHA_MAX_CALLS    = 100
 
 # Call counters file
 COUNTER_FILE = "/home/ubuntu/.api_counters"
@@ -480,7 +480,7 @@ def full_analysis(symbol):
     elif momentum < -0.5:       score -= 8
     if news == "POSITIVE":      score += 5
     elif news == "NEGATIVE":    score -= 5
-    if score >= 55:    final_signal = "BUY"
+    if score >= 40:    final_signal = "BUY"
     elif score <= -20: final_signal = "SELL"
     else:              final_signal = "HOLD"
     return {
