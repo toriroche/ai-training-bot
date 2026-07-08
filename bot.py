@@ -979,7 +979,7 @@ def run():
     report.append(f"   Held:     {len(held)}")
     report.append(f"   P&L:      ${profit:+,.2f}")
     report.append(f"{'='*45}")
-    report.append(f"✅ Next run in 30 mins")
+    report.append(f"✅ Next run in 10 mins")
     report.append(f"{'='*45}")
 
     print("\n".join(report))
