@@ -1,5 +1,4 @@
 import urllib.request
-import urllib.parse
 import json
 import pandas as pd
 from datetime import datetime, timedelta
@@ -13,39 +12,34 @@ from zoneinfo import ZoneInfo
 # =============================================
 # CONNECTIONS
 # =============================================
-ALPACA_KEY         = os.environ.get("ALPACA_API_KEY")
-ALPACA_SECRET      = os.environ.get("ALPACA_SECRET_KEY")
-ALPACA_URL         = "https://paper-api.alpaca.markets"
-EMAIL_ADDRESS      = os.environ.get("EMAIL_ADDRESS")
-EMAIL_PASSWORD     = os.environ.get("EMAIL_PASSWORD")
-FINNHUB_KEY        = os.environ.get("FINNHUB_API_KEY")
-ALPHA_VANTAGE_KEY  = os.environ.get("ALPHA_VANTAGE_API_KEY")
+ALPACA_KEY        = os.environ.get("ALPACA_API_KEY")
+ALPACA_SECRET     = os.environ.get("ALPACA_SECRET_KEY")
+ALPACA_URL        = "https://paper-api.alpaca.markets"
+EMAIL_ADDRESS     = os.environ.get("EMAIL_ADDRESS")
+EMAIL_PASSWORD    = os.environ.get("EMAIL_PASSWORD")
+FINNHUB_KEY       = os.environ.get("FINNHUB_API_KEY")
+ALPHA_VANTAGE_KEY = os.environ.get("ALPHA_VANTAGE_API_KEY")
 
 # =============================================
 # SETTINGS
 # =============================================
 WEEKLY_BUDGET      = 100
-STOP_LOSS          = 0.005   # 0.5% — tighter stop
-TAKE_PROFIT        = 0.01    # 1% — faster wins
-MAX_POSITIONS      = 6
+TAKE_PROFIT        = 0.0075   # 0.75% take profit
+STOP_LOSS          = 0.003    # 0.3% stop loss
+DAILY_LOSS_LIMIT   = 2.00     # Stop trading if down $2
+MAX_POSITIONS      = 3
 MIN_ORDER          = 1.00
-RSI_PERIOD         = 10
-RSI_OVERBOUGHT     = 60      # More aggressive
-RSI_OVERSOLD       = 40      # More aggressive
-VOLUME_CONFIRM     = 1.2     # Less strict
+MIN_MOMENTUM       = 0.003    # 0.3% move to trigger scalp
 EARNINGS_SAFE_DAYS = 5
 SCREENER_MAX       = 5
 ET                 = ZoneInfo("America/New_York")
 EARLY_CLOSE_DATES  = ["07-03", "07-04", "11-28", "12-24"]
 
-# Rate limiting — max calls per day
-YAHOO_MAX_CALLS    = 500
-FINNHUB_MAX_CALLS  = 200
-ALPHA_MAX_CALLS    = 100
-
-# Call counters file
-COUNTER_FILE = "/home/ubuntu/.api_counters"
+# File paths
 SENT_FILE    = "/home/ubuntu/.bot_sent"
+ORB_FILE     = "/home/ubuntu/.orb_ranges"
+TRADES_FILE  = "/home/ubuntu/.bot_trades"
+LOSS_FILE    = "/home/ubuntu/.bot_daily_loss"
 
 # =============================================
 # WATCHLIST
@@ -53,37 +47,8 @@ SENT_FILE    = "/home/ubuntu/.bot_sent"
 WATCHLIST = [
     "MSFT", "AAPL", "GOOGL", "AMZN", "META",
     "NVDA", "AMD", "TSLA", "CRM", "SHOP",
-    "PLTR", "SOFI", "BAC", "F",
-    "AEM", "GLD",
+    "PLTR", "SOFI", "BAC", "F", "AEM", "GLD",
 ]
-
-# =============================================
-# RATE LIMITING
-# =============================================
-def load_counters():
-    today = datetime.now(ET).strftime("%Y-%m-%d")
-    try:
-        with open(COUNTER_FILE, "r") as f:
-            data = json.load(f)
-        if data.get("date") != today:
-            return {"date": today, "yahoo": 0, "finnhub": 0, "alpha": 0}
-        return data
-    except Exception:
-        return {"date": today, "yahoo": 0, "finnhub": 0, "alpha": 0}
-
-def save_counters(counters):
-    with open(COUNTER_FILE, "w") as f:
-        json.dump(counters, f)
-
-def can_call(source):
-    counters = load_counters()
-    limits   = {"yahoo": YAHOO_MAX_CALLS, "finnhub": FINNHUB_MAX_CALLS, "alpha": ALPHA_MAX_CALLS}
-    return counters.get(source, 0) < limits.get(source, 100)
-
-def increment_counter(source):
-    counters = load_counters()
-    counters[source] = counters.get(source, 0) + 1
-    save_counters(counters)
 
 # =============================================
 # MARKET TIMING
@@ -111,27 +76,16 @@ def is_market_open():
         return False, f"After hours — closed {close_str} ET"
     return True, f"OPEN — {now_et.strftime('%I:%M %p')} ET"
 
-def is_pre_market():
-    now_et  = datetime.now(ET)
-    weekday = now_et.weekday()
-    if weekday >= 5:
-        return False
-    pre_start = now_et.replace(hour=8,  minute=30, second=0, microsecond=0)
-    pre_end   = now_et.replace(hour=9,  minute=0,  second=0, microsecond=0)
-    return pre_start <= now_et < pre_end
+def is_orb_window():
+    now_et = datetime.now(ET)
+    start  = now_et.replace(hour=9,  minute=0,  second=0, microsecond=0)
+    end    = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
+    return start <= now_et < end
 
 def is_end_of_day():
     now_et       = datetime.now(ET)
     market_close = get_market_close_time()
-    close_30min  = market_close - timedelta(minutes=30)
-    return now_et >= close_30min
-
-def is_overnight():
-    now_et  = datetime.now(ET)
-    weekday = now_et.weekday()
-    if weekday >= 5:
-        return True
-    return now_et.hour < 8 or now_et.hour >= 21
+    return now_et >= market_close - timedelta(minutes=30)
 
 def already_sent_today(email_type="eod"):
     today = datetime.now(ET).strftime("%Y-%m-%d")
@@ -147,6 +101,66 @@ def mark_sent_today(email_type="eod"):
         f.write(today)
 
 # =============================================
+# DAILY LOSS TRACKING
+# =============================================
+def get_daily_loss():
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    try:
+        with open(LOSS_FILE, "r") as f:
+            data = json.load(f)
+        if data.get("date") != today:
+            return 0.0
+        return data.get("loss", 0.0)
+    except Exception:
+        return 0.0
+
+def add_daily_loss(amount):
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    loss  = get_daily_loss() + abs(amount)
+    with open(LOSS_FILE, "w") as f:
+        json.dump({"date": today, "loss": loss}, f)
+    return loss
+
+def daily_loss_exceeded():
+    return get_daily_loss() >= DAILY_LOSS_LIMIT
+
+# =============================================
+# TRADE LOG
+# =============================================
+def log_trade(symbol, action, price, amount, pl=0, strategy=""):
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    now   = datetime.now(ET).strftime("%I:%M %p")
+    try:
+        with open(TRADES_FILE, "r") as f:
+            data = json.load(f)
+        if data.get("date") != today:
+            data = {"date": today, "trades": []}
+    except Exception:
+        data = {"date": today, "trades": []}
+    data["trades"].append({
+        "time":     now,
+        "symbol":   symbol,
+        "action":   action,
+        "price":    price,
+        "amount":   amount,
+        "pl":       pl,
+        "strategy": strategy,
+    })
+    with open(TRADES_FILE, "w") as f:
+        json.dump(data, f)
+
+def get_todays_trades():
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    try:
+        with open(TRADES_FILE, "r") as f:
+            data = json.load(f)
+        if data.get("date") != today:
+            return []
+        return data.get("trades", [])
+    except Exception:
+        return []
+
+# =============================================
 # ALPACA API
 # =============================================
 def alpaca_request(method, endpoint, data=None):
@@ -157,7 +171,7 @@ def alpaca_request(method, endpoint, data=None):
     req.add_header("Content-Type", "application/json")
     if data:
         req.data = json.dumps(data).encode()
-    with urllib.request.urlopen(req) as r:
+    with urllib.request.urlopen(req, timeout=10) as r:
         return json.loads(r.read())
 
 def get_account():
@@ -173,7 +187,7 @@ def cancel_all_orders():
     except Exception:
         return 0
 
-def place_fractional_order(symbol, dollars, side):
+def place_order(symbol, dollars, side):
     if dollars < MIN_ORDER:
         return None
     return alpaca_request("POST", "/v2/orders", {
@@ -181,16 +195,17 @@ def place_fractional_order(symbol, dollars, side):
         "notional":      str(round(dollars, 2)),
         "side":          side,
         "type":          "market",
-        "time_in_force": "day"
+        "time_in_force": "day",
     })
 
 def close_position_safely(symbol, market_value, unrealized_pl):
     try:
-        result = place_fractional_order(symbol, float(market_value), "sell")
+        result = place_order(symbol, float(market_value), "sell")
         if result:
             return True, float(unrealized_pl)
     except Exception as e:
-        if "403" in str(e) or "Forbidden" in str(e) or "insufficient" in str(e.lower() if hasattr(e, 'lower') else str(e)):
+        err = str(e).lower()
+        if "403" in err or "forbidden" in err or "insufficient" in err:
             try:
                 alpaca_request("DELETE", f"/v2/positions/{symbol}")
                 return True, float(unrealized_pl)
@@ -199,14 +214,10 @@ def close_position_safely(symbol, market_value, unrealized_pl):
     return False, 0
 
 def close_all_positions(report):
-    report.append(f"\n🔔 Closing all positions")
-
-    # Step 1 — Cancel all pending orders first
+    report.append(f"\n🔔 Closing all positions for the day")
     cancelled = cancel_all_orders()
     report.append(f"   📋 Cancelled {cancelled} pending orders")
-    time.sleep(2)  # Wait for cancellations to process
-
-    # Step 2 — Close all positions
+    time.sleep(2)
     try:
         positions = get_positions()
         if not positions:
@@ -214,30 +225,75 @@ def close_all_positions(report):
             return 0
         total_pl = 0
         for pos in positions:
-            symbol     = pos["symbol"]
-            market_val = float(pos["market_value"])
-            pl         = float(pos["unrealized_pl"])
-            success, closed_pl = close_position_safely(symbol, market_val, pl)
+            symbol = pos["symbol"]
+            pl     = float(pos["unrealized_pl"])
+            success, closed_pl = close_position_safely(
+                symbol, float(pos["market_value"]), pl)
             if success:
                 total_pl += closed_pl
                 emoji = "💰" if closed_pl >= 0 else "🛑"
                 report.append(f"   {emoji} Closed {symbol}: ${closed_pl:+.2f}")
+                log_trade(symbol, "CLOSE EOD", float(pos["current_price"]),
+                         float(pos["market_value"]), closed_pl, "End of Day")
+                if closed_pl < 0:
+                    add_daily_loss(closed_pl)
             else:
-                report.append(f"   ⚠️ Could not close {symbol} — check Alpaca")
-        report.append(f"   📊 Total P&L: ${total_pl:+.2f}")
+                report.append(f"   ⚠️ Could not close {symbol} — will clear Monday")
+        report.append(f"   📊 Total EOD P&L: ${total_pl:+.2f}")
         return total_pl
     except Exception as e:
         report.append(f"   ⚠️ Error: {e}")
         return 0
 
 # =============================================
-# DATA SOURCES
+# REAL-TIME DATA — ALPACA
 # =============================================
+def get_latest_price(symbol):
+    """Get real-time latest price from Alpaca"""
+    try:
+        url = f"https://data.alpaca.markets/v2/stocks/{symbol}/trades/latest"
+        req = urllib.request.Request(url)
+        req.add_header("APCA-API-KEY-ID", ALPACA_KEY)
+        req.add_header("APCA-API-SECRET-KEY", ALPACA_SECRET)
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.loads(r.read())
+        return float(data["trade"]["p"])
+    except Exception:
+        return get_price_yahoo(symbol)
 
-# Yahoo Finance — Primary price data
-def get_stock_data_yahoo(symbol):
-    if not can_call("yahoo"):
-        return None, None
+def get_price_yahoo(symbol):
+    """Fallback price from Yahoo"""
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1m&range=1d"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.loads(r.read())
+        closes = data["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+        closes = [c for c in closes if c is not None]
+        return closes[-1] if closes else None
+    except Exception:
+        return None
+
+def get_bars(symbol, timeframe="1Min", limit=30):
+    """Get recent bars from Alpaca for momentum calculation"""
+    try:
+        end   = datetime.now(ET)
+        start = end - timedelta(hours=2)
+        url   = (f"https://data.alpaca.markets/v2/stocks/{symbol}/bars"
+                 f"?timeframe={timeframe}&start={start.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+                 f"&end={end.strftime('%Y-%m-%dT%H:%M:%SZ')}&limit={limit}")
+        req = urllib.request.Request(url)
+        req.add_header("APCA-API-KEY-ID", ALPACA_KEY)
+        req.add_header("APCA-API-SECRET-KEY", ALPACA_SECRET)
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.loads(r.read())
+        bars = data.get("bars", [])
+        return bars
+    except Exception:
+        return []
+
+def get_daily_bars(symbol):
+    """Get daily bars for ORB and general analysis"""
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=3mo"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -247,298 +303,316 @@ def get_stock_data_yahoo(symbol):
         quotes  = result["indicators"]["quote"][0]
         closes  = [p for p in quotes["close"]  if p is not None]
         volumes = [v for v in quotes["volume"] if v is not None]
-        increment_counter("yahoo")
         return closes, volumes
     except Exception:
         return None, None
 
-# Alpha Vantage — Backup price data
-def get_stock_data_alpha(symbol):
-    if not can_call("alpha") or not ALPHA_VANTAGE_KEY:
-        return None, None
+# =============================================
+# STRATEGY 1 — OPENING RANGE BREAKOUT (ORB)
+# =============================================
+def update_orb_ranges(report):
+    """During 9:00-9:30am build the opening range for each stock"""
+    today = datetime.now(ET).strftime("%Y-%m-%d")
     try:
-        url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={symbol}&apikey={ALPHA_VANTAGE_KEY}&outputsize=compact"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            data = json.loads(r.read())
-        ts     = data.get("Time Series (Daily)", {})
-        closes = [float(v["4. close"]) for v in list(ts.values())[:60]]
-        closes.reverse()
-        increment_counter("alpha")
-        return closes, None
+        with open(ORB_FILE, "r") as f:
+            orb_data = json.load(f)
+        if orb_data.get("date") != today:
+            orb_data = {"date": today, "ranges": {}}
     except Exception:
-        return None, None
+        orb_data = {"date": today, "ranges": {}}
 
-def get_stock_data(symbol):
-    # Try Yahoo first
-    closes, volumes = get_stock_data_yahoo(symbol)
-    if closes and len(closes) >= 20:
-        return closes, volumes
-    # Fallback to Alpha Vantage
-    closes, volumes = get_stock_data_alpha(symbol)
-    if closes and len(closes) >= 20:
-        return closes, volumes or []
-    return None, None
+    report.append(f"\n📐 BUILDING OPENING RANGE (9:00-9:30am)")
+    for symbol in WATCHLIST:
+        try:
+            bars = get_bars(symbol, "1Min", 35)
+            if not bars:
+                continue
+            now_et    = datetime.now(ET)
+            open_time = now_et.replace(hour=9, minute=0, second=0, microsecond=0)
+            orb_bars  = [b for b in bars if b.get("t", "") >= open_time.strftime("%Y-%m-%dT%H:%M")]
+            if not orb_bars:
+                continue
+            highs = [b["h"] for b in orb_bars]
+            lows  = [b["l"] for b in orb_bars]
+            orb_data["ranges"][symbol] = {
+                "high":   max(highs),
+                "low":    min(lows),
+                "volume": sum(b.get("v", 0) for b in orb_bars),
+            }
+        except Exception:
+            continue
 
-# Finnhub — News sentiment
-def get_news_finnhub(symbol):
-    if not can_call("finnhub") or not FINNHUB_KEY:
-        return "NEUTRAL", []
+    with open(ORB_FILE, "w") as f:
+        json.dump(orb_data, f)
+
+    report.append(f"   ✅ Ranges set for {len(orb_data['ranges'])} stocks")
+    return orb_data["ranges"]
+
+def check_orb_breakouts(held, cash, report):
+    """After 9:30am — check if any stock broke above its ORB high"""
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    buys  = []
     try:
-        today     = datetime.now(ET)
-        week_ago  = today - timedelta(days=7)
-        from_date = week_ago.strftime("%Y-%m-%d")
-        to_date   = today.strftime("%Y-%m-%d")
-        url = f"https://finnhub.io/api/v1/company-news?symbol={symbol}&from={from_date}&to={to_date}&token={FINNHUB_KEY}"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            articles = json.loads(r.read())
-        increment_counter("finnhub")
-
-        positive_words = ["surge","soar","jump","gain","beat","strong","growth","profit","record","bull","upgrade","positive","win","boost","rally","up"]
-        negative_words = ["drop","fall","plunge","loss","miss","weak","decline","bear","downgrade","negative","crash","risk","warn","cut","layoff","lawsuit","down"]
-
-        pos_count = 0
-        neg_count = 0
-        headlines = []
-        for article in articles[:10]:
-            headline = article.get("headline", "").lower()
-            headlines.append(article.get("headline", ""))
-            pos_count += sum(headline.count(w) for w in positive_words)
-            neg_count += sum(headline.count(w) for w in negative_words)
-
-        if pos_count > neg_count * 1.5:   return "POSITIVE", headlines[:3]
-        elif neg_count > pos_count * 1.5: return "NEGATIVE", headlines[:3]
-        return "NEUTRAL", headlines[:3]
+        with open(ORB_FILE, "r") as f:
+            orb_data = json.load(f)
+        if orb_data.get("date") != today:
+            return buys
+        ranges = orb_data.get("ranges", {})
     except Exception:
-        return get_news_yahoo(symbol), []
+        return buys
 
-# Yahoo News — Fallback
-def get_news_yahoo(symbol):
+    report.append(f"\n📐 ORB BREAKOUT SCAN")
+    for symbol, r in ranges.items():
+        if symbol in held:
+            continue
+        try:
+            price = get_latest_price(symbol)
+            if not price:
+                continue
+            orb_high = r["high"]
+            breakout_pct = ((price - orb_high) / orb_high) * 100
+            if price > orb_high * 1.001:  # 0.1% above ORB high
+                report.append(f"   🚀 {symbol} @ ${price:.2f} broke ORB high ${orb_high:.2f} (+{breakout_pct:.2f}%)")
+                buys.append({
+                    "symbol":   symbol,
+                    "price":    price,
+                    "score":    90,
+                    "strategy": "ORB Breakout",
+                    "detail":   f"Broke ORB high ${orb_high:.2f}",
+                })
+            else:
+                report.append(f"   ⏳ {symbol} @ ${price:.2f} | ORB high: ${orb_high:.2f}")
+        except Exception:
+            continue
+
+    return buys
+
+# =============================================
+# STRATEGY 2 — NEWS CATALYST
+# =============================================
+def check_news_catalysts(held, report):
+    """Check for breaking news on watchlist stocks"""
+    if not FINNHUB_KEY:
+        return []
+    buys = []
+    report.append(f"\n📰 NEWS CATALYST SCAN")
+    today    = datetime.now(ET)
+    week_ago = today - timedelta(hours=4)  # Last 4 hours only
+
+    for symbol in WATCHLIST[:8]:  # Limit to save API calls
+        if symbol in held:
+            continue
+        try:
+            url = (f"https://finnhub.io/api/v1/company-news?symbol={symbol}"
+                   f"&from={week_ago.strftime('%Y-%m-%d')}"
+                   f"&to={today.strftime('%Y-%m-%d')}&token={FINNHUB_KEY}")
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                articles = json.loads(r.read())
+
+            if not articles:
+                continue
+
+            positive_words = ["beat","surge","soar","jump","record","upgrade",
+                            "profit","growth","strong","win","boost","rally"]
+            negative_words = ["miss","drop","fall","plunge","loss","downgrade",
+                            "weak","decline","crash","warn","cut","layoff"]
+
+            recent = articles[:3]
+            pos = sum(1 for a in recent for w in positive_words
+                     if w in a.get("headline","").lower())
+            neg = sum(1 for a in recent for w in negative_words
+                     if w in a.get("headline","").lower())
+
+            if pos > neg and pos >= 2:
+                price = get_latest_price(symbol)
+                if price:
+                    headline = recent[0].get("headline", "")[:60]
+                    report.append(f"   📢 {symbol} @ ${price:.2f} — {headline}...")
+                    buys.append({
+                        "symbol":   symbol,
+                        "price":    price,
+                        "score":    85,
+                        "strategy": "News Catalyst",
+                        "detail":   headline,
+                    })
+            else:
+                report.append(f"   — {symbol}: no strong catalyst")
+
+        except Exception:
+            continue
+
+    return buys
+
+# =============================================
+# STRATEGY 3 — MOMENTUM SCALPING
+# =============================================
+def check_momentum_scalps(held, report):
+    """Find stocks moving 0.3%+ in last 5 minutes"""
+    buys = []
+    report.append(f"\n⚡ MOMENTUM SCALP SCAN")
+
+    for symbol in WATCHLIST:
+        if symbol in held:
+            continue
+        try:
+            bars = get_bars(symbol, "1Min", 10)
+            if len(bars) < 5:
+                continue
+
+            prices  = [b["c"] for b in bars]
+            volumes = [b["v"] for b in bars]
+            current = prices[-1]
+            price_5m_ago = prices[-5]
+            avg_volume   = sum(volumes[:-1]) / max(len(volumes)-1, 1)
+            latest_vol   = volumes[-1]
+
+            move_pct = (current - price_5m_ago) / price_5m_ago
+
+            if move_pct >= MIN_MOMENTUM and latest_vol > avg_volume * 1.2:
+                report.append(f"   ⚡ {symbol} @ ${current:.2f} "
+                             f"up {move_pct*100:.2f}% in 5min | "
+                             f"Vol: {latest_vol/avg_volume:.1f}x avg")
+                buys.append({
+                    "symbol":   symbol,
+                    "price":    current,
+                    "score":    70 + min(int(move_pct * 1000), 20),
+                    "strategy": "Momentum Scalp",
+                    "detail":   f"+{move_pct*100:.2f}% in 5min",
+                })
+            else:
+                report.append(f"   ⏳ {symbol} @ ${current:.2f} | "
+                             f"Move: {move_pct*100:+.2f}%")
+
+        except Exception:
+            continue
+
+    return buys
+
+# =============================================
+# NEWS FOR EARNINGS CHECK
+# =============================================
+def has_upcoming_earnings(symbol):
     try:
-        url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol}&region=US&lang=en-US"
+        if not FINNHUB_KEY:
+            return False, "Unknown"
+        today  = datetime.now(ET)
+        future = today + timedelta(days=EARNINGS_SAFE_DAYS)
+        url = (f"https://finnhub.io/api/v1/calendar/earnings"
+               f"?from={today.strftime('%Y-%m-%d')}"
+               f"&to={future.strftime('%Y-%m-%d')}"
+               f"&symbol={symbol}&token={FINNHUB_KEY}")
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=5) as r:
-            content = r.read().decode("utf-8")
-        positive_words = ["surge","soar","jump","gain","rise","up","high","beat","strong","growth","profit","record","bull","rally","buy","upgrade","positive","win","boost"]
-        negative_words = ["drop","fall","plunge","loss","down","low","miss","weak","decline","bear","sell","downgrade","negative","crash","risk","warn","cut","layoff","lawsuit"]
-        content_lower = content.lower()
-        pos_count = sum(content_lower.count(w) for w in positive_words)
-        neg_count = sum(content_lower.count(w) for w in negative_words)
-        if pos_count > neg_count * 1.5:   return "POSITIVE"
-        elif neg_count > pos_count * 1.5: return "NEGATIVE"
-        return "NEUTRAL"
-    except Exception:
-        return "NEUTRAL"
-
-# Finnhub — Earnings calendar
-def get_earnings_finnhub(symbol):
-    if not can_call("finnhub") or not FINNHUB_KEY:
-        return has_upcoming_earnings_yahoo(symbol)
-    try:
-        today     = datetime.now(ET)
-        future    = today + timedelta(days=EARNINGS_SAFE_DAYS)
-        from_date = today.strftime("%Y-%m-%d")
-        to_date   = future.strftime("%Y-%m-%d")
-        url = f"https://finnhub.io/api/v1/calendar/earnings?from={from_date}&to={to_date}&symbol={symbol}&token={FINNHUB_KEY}"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as r:
             data = json.loads(r.read())
-        increment_counter("finnhub")
         earnings = data.get("earningsCalendar", [])
         if earnings:
-            date_str = earnings[0].get("date", "")
-            return True, f"Earnings {date_str}"
-        return False, "Clear"
-    except Exception:
-        return has_upcoming_earnings_yahoo(symbol)
-
-def has_upcoming_earnings_yahoo(symbol):
-    try:
-        url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}?modules=calendarEvents"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=5) as r:
-            data = json.loads(r.read())
-        events   = data.get("quoteSummary", {}).get("result", [{}])[0]
-        earnings = events.get("calendarEvents", {}).get("earnings", {})
-        dates    = earnings.get("earningsDate", [])
-        if not dates:
-            return False, "Clear"
-        now_et    = datetime.now(ET)
-        safe_date = now_et + timedelta(days=EARNINGS_SAFE_DAYS)
-        for d in dates:
-            date = datetime.fromtimestamp(d.get("raw", 0), tz=ET)
-            if now_et <= date <= safe_date:
-                return True, f"Earnings {date.strftime('%b %d')}"
+            return True, f"Earnings {earnings[0].get('date','soon')}"
         return False, "Clear"
     except Exception:
         return False, "Unknown"
 
-# Finnhub — Market news (financial only, used internally not emailed)
-def get_market_news():
-    if not can_call("finnhub") or not FINNHUB_KEY:
-        return []
-    try:
-        url = f"https://finnhub.io/api/v1/news?category=merger&token={FINNHUB_KEY}"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            articles = json.loads(r.read())
-        increment_counter("finnhub")
-        return [a.get("headline", "") for a in articles[:10]]
-    except Exception:
-        return []
-
-# Finnhub — Weekly earnings calendar
-def get_weekly_earnings():
-    if not can_call("finnhub") or not FINNHUB_KEY:
-        return []
-    try:
-        today   = datetime.now(ET)
-        friday  = today + timedelta(days=(4 - today.weekday()) % 7)
-        url = f"https://finnhub.io/api/v1/calendar/earnings?from={today.strftime('%Y-%m-%d')}&to={friday.strftime('%Y-%m-%d')}&token={FINNHUB_KEY}"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            data = json.loads(r.read())
-        increment_counter("finnhub")
-        earnings = data.get("earningsCalendar", [])
-        return [{
-            "symbol": e.get("symbol"),
-            "date":   e.get("date"),
-            "estimate": e.get("epsEstimate"),
-        } for e in earnings[:20]]
-    except Exception:
-        return []
-
 # =============================================
-# TECHNICAL INDICATORS
+# POSITION MANAGEMENT
 # =============================================
-def get_ma_signal(prices):
-    df = pd.DataFrame(prices, columns=["close"])
-    df["short"] = df["close"].rolling(5).mean()
-    df["long"]  = df["close"].rolling(15).mean()
-    df["mom"]   = df["close"].pct_change(3)
-    l = df.iloc[-1]
-    p = df.iloc[-2]
-    strength = ((l["short"] - l["long"]) / l["long"]) * 100
-    if p["short"] <= p["long"] and l["short"] > l["long"] and l["mom"] > 0:
-        return "BUY", round(strength, 4)
-    elif p["short"] >= p["long"] and l["short"] < l["long"] and l["mom"] < 0:
-        return "SELL", round(strength, 4)
-    elif l["mom"] > 0.02 and l["short"] > l["long"]:
-        return "BUY", round(strength, 4)
-    return "HOLD", round(strength, 4)
+def manage_positions(held, report):
+    """Check all positions for take profit / stop loss"""
+    sells = 0
+    freed_cash = 0
 
-def get_rsi(prices):
-    df       = pd.DataFrame(prices, columns=["close"])
-    delta    = df["close"].diff()
-    gain     = delta.where(delta > 0, 0)
-    loss     = -delta.where(delta < 0, 0)
-    avg_gain = gain.rolling(RSI_PERIOD).mean()
-    avg_loss = loss.rolling(RSI_PERIOD).mean()
-    rs       = avg_gain / avg_loss
-    rsi      = 100 - (100 / (1 + rs))
-    return round(rsi.iloc[-1], 2)
+    report.append(f"\n📦 POSITION MANAGEMENT")
 
-def get_volume_signal(volumes):
-    if not volumes or len(volumes) < 20:
-        return True, 1.0
-    avg_volume    = sum(volumes[-20:]) / 20
-    latest_volume = volumes[-1]
-    ratio         = latest_volume / avg_volume if avg_volume > 0 else 1.0
-    return ratio >= VOLUME_CONFIRM, round(ratio, 2)
-
-def get_momentum_score(prices):
-    if len(prices) < 10:
-        return 0
-    day1 = (prices[-1] - prices[-2]) / prices[-2] * 100
-    day3 = (prices[-1] - prices[-4]) / prices[-4] * 100
-    day5 = (prices[-1] - prices[-6]) / prices[-6] * 100
-    return round((day1 * 0.5) + (day3 * 0.3) + (day5 * 0.2), 4)
-
-def full_analysis(symbol):
-    prices, volumes          = get_stock_data(symbol)
-    if not prices or len(prices) < 20:
-        return None
-    ma_signal, strength      = get_ma_signal(prices)
-    rsi                      = get_rsi(prices)
-    vol_confirmed, vol_ratio = get_volume_signal(volumes or [])
-    news, headlines          = get_news_finnhub(symbol)
-    momentum                 = get_momentum_score(prices)
-    price                    = prices[-1]
-    score = 0
-    if ma_signal == "BUY":      score += 35
-    elif ma_signal == "SELL":   score -= 35
-    if rsi < RSI_OVERSOLD:      score += 25
-    elif rsi < 45:              score += 12
-    elif rsi > RSI_OVERBOUGHT:  score -= 25
-    else:                       score += 5
-    if vol_confirmed:           score += 20
-    else:                       score += 3
-    if momentum > 1.0:          score += 15
-    elif momentum > 0.5:        score += 8
-    elif momentum < -1.0:       score -= 15
-    elif momentum < -0.5:       score -= 8
-    if news == "POSITIVE":      score += 5
-    elif news == "NEGATIVE":    score -= 5
-    if score >= 40:    final_signal = "BUY"
-    elif score <= -20: final_signal = "SELL"
-    else:              final_signal = "HOLD"
-    return {
-        "symbol":    symbol,
-        "price":     price,
-        "signal":    final_signal,
-        "score":     score,
-        "ma":        ma_signal,
-        "rsi":       rsi,
-        "volume":    vol_ratio,
-        "news":      news,
-        "momentum":  momentum,
-        "headlines": headlines,
-    }
-
-def screen_new_stocks(held, report):
-    report.append(f"\n🔭 SCREENER")
-    report.append(f"{'='*45}")
-    candidates = set()
-    for scrId in ["day_gainers", "most_actives"]:
+    for symbol, pos in held.items():
         try:
-            url = f"https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds={scrId}&count=10"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=5) as r:
-                data = json.loads(r.read())
-            quotes = data.get("finance", {}).get("result", [{}])[0].get("quotes", [])
-            for q in quotes:
-                sym = q.get("symbol", "")
-                if sym and sym not in WATCHLIST and sym not in held:
-                    candidates.add(sym)
-            report.append(f"   📊 {scrId}: {len(quotes)} found")
+            unrealized = float(pos["unrealized_pl"])
+            gain_pct   = float(pos["unrealized_plpc"])
+            market_val = float(pos["market_value"])
+            entry_price = float(pos["avg_entry_price"])
+            current_price = float(pos["current_price"])
+
+            if gain_pct >= TAKE_PROFIT:
+                success, pl = close_position_safely(symbol, market_val, unrealized)
+                if success:
+                    report.append(f"   💰 TAKE PROFIT {symbol}: "
+                                 f"+${unrealized:.2f} ({gain_pct*100:+.2f}%) ✅")
+                    log_trade(symbol, "SELL TP", current_price,
+                             market_val, unrealized, "Take Profit")
+                    freed_cash += market_val
+                    sells += 1
+            elif gain_pct <= -STOP_LOSS:
+                success, pl = close_position_safely(symbol, market_val, unrealized)
+                if success:
+                    report.append(f"   🛑 STOP LOSS {symbol}: "
+                                 f"${unrealized:.2f} ({gain_pct*100:+.2f}%) ✅")
+                    log_trade(symbol, "SELL SL", current_price,
+                             market_val, unrealized, "Stop Loss")
+                    add_daily_loss(abs(unrealized))
+                    freed_cash += market_val
+                    sells += 1
+            else:
+                report.append(f"   📦 {symbol}: ${unrealized:+.2f} "
+                             f"({gain_pct*100:+.2f}%) — holding | "
+                             f"Target: +{TAKE_PROFIT*100}% "
+                             f"Stop: -{STOP_LOSS*100}%")
         except Exception as e:
-            report.append(f"   ⚠️ {scrId}: {e}")
-    new_stocks = []
-    for symbol in list(candidates)[:10]:
-        try:
-            prices, volumes  = get_stock_data(symbol)
-            if not prices or len(prices) < 20: continue
-            ma_signal, _     = get_ma_signal(prices)
-            rsi              = get_rsi(prices)
-            vol_confirmed, _ = get_volume_signal(volumes or [])
-            momentum         = get_momentum_score(prices)
-            earnings, _      = get_earnings_finnhub(symbol)
-            price            = prices[-1]
-            score = 0
-            if ma_signal == "BUY": score += 35
-            if rsi < RSI_OVERSOLD: score += 25
-            if vol_confirmed:      score += 20
-            if momentum > 0.5:     score += 15
-            if earnings:           score -= 50
-            if score >= 55:
-                new_stocks.append({"symbol": symbol, "price": price, "score": score})
-                report.append(f"   🌟 {symbol} @ ${price:.2f} — Score: {score}")
-        except Exception:
+            report.append(f"   ⚠️ {symbol}: {e}")
+
+    return sells, freed_cash
+
+# =============================================
+# BUYING
+# =============================================
+def execute_buys(buy_signals, held, cash, report):
+    """Execute best buy signals — recycle cash immediately"""
+    buys = 0
+    buy_signals.sort(key=lambda x: x["score"], reverse=True)
+
+    report.append(f"\n📥 BUYING")
+
+    for signal in buy_signals:
+        symbol   = signal["symbol"]
+        strategy = signal["strategy"]
+
+        if len(held) + buys >= MAX_POSITIONS:
+            report.append(f"   ⛔ Max {MAX_POSITIONS} positions — skipping {symbol}")
             continue
-    if not new_stocks:
-        report.append(f"   — No strong candidates")
-    return [s["symbol"] for s in sorted(new_stocks, key=lambda x: x["score"], reverse=True)[:SCREENER_MAX]]
+        if symbol in held:
+            continue
+        if daily_loss_exceeded():
+            report.append(f"   🚫 Daily loss limit ${DAILY_LOSS_LIMIT} reached — "
+                         f"no more buys today")
+            break
+
+        # Check earnings safety
+        earnings, e_msg = has_upcoming_earnings(symbol)
+        if earnings:
+            report.append(f"   ⚠️ {symbol} blocked — {e_msg}")
+            continue
+
+        budget = round(WEEKLY_BUDGET / MAX_POSITIONS, 2)
+        if cash < budget:
+            report.append(f"   ⚠️ Not enough cash (${cash:.2f})")
+            continue
+        if budget < MIN_ORDER:
+            continue
+
+        try:
+            result = place_order(symbol, budget, "buy")
+            if result:
+                report.append(f"   📈 BOUGHT {symbol} @ ${signal['price']:.2f} | "
+                             f"${budget:.2f} | Strategy: {strategy} | "
+                             f"Score: {signal['score']}")
+                log_trade(symbol, "BUY", signal["price"],
+                         budget, 0, strategy)
+                cash -= budget
+                buys += 1
+        except Exception as e:
+            report.append(f"   ⚠️ {symbol}: {e}")
+
+    if buys == 0:
+        report.append(f"   — No buys this cycle")
+
+    return buys, cash
 
 # =============================================
 # EMAIL
@@ -546,7 +620,6 @@ def screen_new_stocks(held, report):
 def send_email(subject, report_lines, is_error=False):
     try:
         if not EMAIL_ADDRESS or not EMAIL_PASSWORD:
-            print("⚠️ Email credentials not set")
             return False
         body  = "\n".join(report_lines)
         msg   = MIMEMultipart("alternative")
@@ -555,13 +628,18 @@ def send_email(subject, report_lines, is_error=False):
         msg["To"]      = EMAIL_ADDRESS
         color = "#ff4444" if is_error else "#00ff00"
         html  = f"""
-        <html><body style="font-family:monospace;background:#0a0a0a;color:{color};padding:20px;">
-            <div style="max-width:600px;margin:0 auto;background:#111;padding:20px;
-                        border-radius:10px;border:1px solid {color};">
+        <html><body style="font-family:monospace;background:#0a0a0a;
+                           color:{color};padding:20px;">
+            <div style="max-width:600px;margin:0 auto;background:#111;
+                        padding:20px;border-radius:10px;
+                        border:1px solid {color};">
                 <h2 style="color:{color};">🤖 AI Trading Bot</h2>
-                <pre style="color:{color};font-size:13px;line-height:1.6;">{body}</pre>
+                <pre style="color:{color};font-size:12px;
+                            line-height:1.6;">{body}</pre>
                 <hr style="border-color:{color};">
-                <p style="color:#555;font-size:11px;">Paper Trading — No real money at risk</p>
+                <p style="color:#555;font-size:11px;">
+                    Paper Trading — No real money at risk
+                </p>
             </div>
         </body></html>"""
         msg.attach(MIMEText(body, "plain"))
@@ -576,179 +654,26 @@ def send_email(subject, report_lines, is_error=False):
         return False
 
 # =============================================
-# LEVEL 1 — PRE-MARKET BRIEFING (8:30am)
+# SCREENER — find new stocks beyond watchlist
 # =============================================
-def send_premarket_briefing():
-    if already_sent_today("premarket"):
-        return
-    now_et = datetime.now(ET)
-    report = []
-    report.append(f"🌅 PRE-MARKET BRIEFING")
-    report.append(f"📅 {now_et.strftime('%A %B %d, %Y')}")
-    report.append(f"⏰ {now_et.strftime('%I:%M %p')} ET — Market opens in 30 minutes")
-    report.append("="*45)
-
-    # Get earnings for today
-    earnings = get_weekly_earnings()
-    today_str = now_et.strftime("%Y-%m-%d")
-    today_earnings = [e for e in earnings if e.get("date") == today_str]
-
-    if today_earnings:
-        report.append(f"\n⚠️ EARNINGS TODAY — Avoid these stocks:")
-        for e in today_earnings:
-            report.append(f"   • {e['symbol']} — Est: ${e.get('estimate', 'N/A')}")
-    else:
-        report.append(f"\n✅ No major earnings today")
-
-    # Market news
-    news = get_market_news()
-    if news:
-        report.append(f"\n📰 OVERNIGHT MARKET NEWS:")
-        for headline in news[:5]:
-            report.append(f"   • {headline}")
-
-    # Pre-scan top opportunities
-    report.append(f"\n🔍 TOP OPPORTUNITIES AT OPEN:")
-    opportunities = []
-    for symbol in WATCHLIST[:8]:
+def screen_new_stocks(held):
+    candidates = set()
+    for scrId in ["day_gainers", "most_actives"]:
         try:
-            a = full_analysis(symbol)
-            if a and a["signal"] == "BUY":
-                opportunities.append(a)
+            url = (f"https://query1.finance.yahoo.com/v1/finance/screener/"
+                   f"predefined/saved?scrIds={scrId}&count=10")
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                data = json.loads(r.read())
+            quotes = (data.get("finance", {}).get("result", [{}])[0]
+                     .get("quotes", []))
+            for q in quotes:
+                sym = q.get("symbol", "")
+                if sym and sym not in WATCHLIST and sym not in held:
+                    candidates.add(sym)
         except Exception:
             continue
-
-    opportunities.sort(key=lambda x: x["score"], reverse=True)
-    if opportunities:
-        for opp in opportunities[:5]:
-            report.append(f"   🟢 {opp['symbol']} @ ${opp['price']:.2f} | Score: {opp['score']}/100 | Mom: {opp['momentum']:+.2f}%")
-    else:
-        report.append(f"   — No strong BUY signals pre-market")
-
-    report.append(f"\n{'='*45}")
-    report.append(f"💰 Budget: ${WEEKLY_BUDGET} | Stop: {STOP_LOSS*100}% | Target: {TAKE_PROFIT*100}%")
-    report.append(f"🔔 Bot will start trading at 9:00am ET")
-    report.append(f"{'='*45}")
-
-    if send_email(f"🌅 Pre-Market Briefing — {now_et.strftime('%b %d')}", report):
-        mark_sent_today("premarket")
-
-# =============================================
-# LEVEL 2 — OVERNIGHT NEWS MONITOR
-# =============================================
-def send_overnight_update():
-    if already_sent_today("overnight"):
-        return
-    now_et = datetime.now(ET)
-    if now_et.hour != 0:  # Only at midnight
-        return
-    report = []
-    report.append(f"🌙 OVERNIGHT MARKET UPDATE")
-    report.append(f"📅 {now_et.strftime('%A %B %d, %Y — %I:%M %p')} ET")
-    report.append("="*45)
-
-    news = get_market_news()
-    if news:
-        report.append(f"\n📰 LATEST MARKET NEWS:")
-        for headline in news[:8]:
-            report.append(f"   • {headline}")
-    else:
-        report.append(f"\n   — No major news at this time")
-
-    # Check watchlist news
-    report.append(f"\n📊 WATCHLIST NEWS SCAN:")
-    for symbol in ["NVDA", "AAPL", "MSFT", "GOOGL", "META"]:
-        try:
-            sentiment, headlines = get_news_finnhub(symbol)
-            if sentiment != "NEUTRAL" and headlines:
-                emoji = "🟢" if sentiment == "POSITIVE" else "🔴"
-                report.append(f"   {emoji} {symbol} — {sentiment}")
-                report.append(f"      {headlines[0][:80]}...")
-        except Exception:
-            continue
-
-    report.append(f"\n{'='*45}")
-    report.append(f"💤 Bot continues monitoring overnight")
-    report.append(f"🌅 Pre-market briefing at 8:30am ET")
-    report.append(f"{'='*45}")
-
-    if send_email(f"🌙 Overnight Update — {now_et.strftime('%b %d')}", report):
-        mark_sent_today("overnight")
-
-# =============================================
-# LEVEL 3 — WEEKEND RESEARCH
-# =============================================
-def send_weekend_research():
-    now_et  = datetime.now(ET)
-    weekday = now_et.weekday()
-
-    # Saturday — weekly recap
-    if weekday == 5 and not already_sent_today("weekend_sat"):
-        report = []
-        report.append(f"📊 WEEKEND RESEARCH — Saturday Recap")
-        report.append(f"📅 {now_et.strftime('%B %d, %Y')}")
-        report.append("="*45)
-
-        # Weekly earnings coming up
-        earnings = get_weekly_earnings()
-        if earnings:
-            report.append(f"\n📅 EARNINGS NEXT WEEK:")
-            for e in earnings[:10]:
-                report.append(f"   • {e['symbol']} — {e['date']} | Est: ${e.get('estimate', 'N/A')}")
-
-        # Market news recap
-        news = get_market_news()
-        report.append(f"\n📰 MARKET HEADLINES:")
-        for headline in news[:5]:
-            report.append(f"   • {headline}")
-
-        report.append(f"\n{'='*45}")
-        report.append(f"📋 Full Monday strategy coming Sunday")
-        report.append(f"{'='*45}")
-
-        if send_email(f"📊 Weekend Research — {now_et.strftime('%b %d')}", report):
-            mark_sent_today("weekend_sat")
-
-    # Sunday — Monday strategy
-    elif weekday == 6 and not already_sent_today("weekend_sun"):
-        report = []
-        report.append(f"🗓️ MONDAY MORNING STRATEGY")
-        report.append(f"📅 {now_et.strftime('%B %d, %Y')} — Preparing for Monday open")
-        report.append("="*45)
-
-        # Earnings to avoid Monday
-        earnings = get_weekly_earnings()
-        monday   = (now_et + timedelta(days=1)).strftime("%Y-%m-%d")
-        monday_earnings = [e for e in earnings if e.get("date") == monday]
-
-        if monday_earnings:
-            report.append(f"\n⚠️ MONDAY EARNINGS — Bot will avoid:")
-            for e in monday_earnings:
-                report.append(f"   🚫 {e['symbol']} — reporting Monday")
-
-        # Pre-scan for Monday opportunities
-        report.append(f"\n🎯 STOCKS TO WATCH MONDAY:")
-        opportunities = []
-        for symbol in WATCHLIST:
-            try:
-                a = full_analysis(symbol)
-                if a and a["score"] >= 40:
-                    opportunities.append(a)
-            except Exception:
-                continue
-
-        opportunities.sort(key=lambda x: x["score"], reverse=True)
-        for opp in opportunities[:8]:
-            emoji = "🟢" if opp["signal"] == "BUY" else "⏳"
-            report.append(f"   {emoji} {opp['symbol']} @ ${opp['price']:.2f} | Score: {opp['score']}/100")
-
-        report.append(f"\n{'='*45}")
-        report.append(f"💰 Budget: ${WEEKLY_BUDGET} ready to deploy")
-        report.append(f"🔔 Bot starts trading Monday 9:00am ET")
-        report.append(f"{'='*45}")
-
-        if send_email(f"🗓️ Monday Strategy — {now_et.strftime('%b %d')}", report):
-            mark_sent_today("weekend_sun")
+    return list(candidates)[:SCREENER_MAX]
 
 # =============================================
 # MAIN BOT
@@ -758,32 +683,24 @@ def run():
     weekday     = now_et.weekday()
     early_close = is_early_close()
 
-    # ── WEEKEND — silent intel gathering, NO emails ──
+    # ── WEEKEND — silent ──────────────────────
     if weekday >= 5:
-        print(f"Weekend — bot monitoring silently. No email until weekday close.")
-        get_weekly_earnings()  # Gather data silently
+        print(f"Weekend — bot monitoring silently")
         return
 
-    # ── OVERNIGHT WEEKDAY — silent monitoring ──
-    if is_overnight():
-        print(f"Overnight — bot monitoring silently")
-        return
-
-    # ── MARKET IS CLOSED (after hours) ───────
     market_open, market_msg = is_market_open()
 
+    # ── AFTER HOURS — EOD email once ─────────
     if not market_open and now_et.hour >= 9:
         if already_sent_today("eod"):
-            print(f"📧 EOD email already sent today")
+            print(f"EOD email already sent — sleeping")
             return
 
         report = []
         report.append(f"🤖 AI Trading Bot — End of Day Report")
         report.append(f"📅 {now_et.strftime('%A %B %d, %Y')}")
         report.append(f"⏰ {now_et.strftime('%I:%M %p')} ET")
-        report.append(f"{'⚠️ EARLY CLOSE DAY' if early_close else '📅 Regular day'}")
         report.append("="*45)
-        report.append(f"🕐 {market_msg}")
 
         profit    = 0
         portfolio = 100000
@@ -798,22 +715,40 @@ def run():
         except Exception as e:
             report.append(f"⚠️ Account error: {e}")
 
-        # API usage summary
-        counters = load_counters()
-        report.append(f"\n📊 API USAGE TODAY:")
-        report.append(f"   Yahoo Finance:  {counters.get('yahoo', 0)}/{YAHOO_MAX_CALLS} calls")
-        report.append(f"   Finnhub:        {counters.get('finnhub', 0)}/{FINNHUB_MAX_CALLS} calls")
-        report.append(f"   Alpha Vantage:  {counters.get('alpha', 0)}/{ALPHA_MAX_CALLS} calls")
+        # Today's trade log
+        trades = get_todays_trades()
+        if trades:
+            report.append(f"\n📋 TODAY'S TRADES ({len(trades)} total):")
+            wins   = [t for t in trades if t.get("pl", 0) > 0]
+            losses = [t for t in trades if t.get("pl", 0) < 0]
+            report.append(f"   ✅ Wins: {len(wins)} | ❌ Losses: {len(losses)}")
+            for t in trades:
+                pl_str = f"${t['pl']:+.2f}" if t['pl'] != 0 else ""
+                report.append(f"   {t['time']} {t['action']} {t['symbol']} "
+                             f"@ ${t['price']:.2f} {pl_str} [{t['strategy']}]")
+        else:
+            report.append(f"\n📋 No trades executed today")
+
+        # Daily loss check
+        daily_loss = get_daily_loss()
+        if daily_loss > 0:
+            report.append(f"\n🛡 Daily loss total: ${daily_loss:.2f} / "
+                         f"${DAILY_LOSS_LIMIT:.2f} limit")
 
         report.append(f"\n{'='*45}")
         report.append(f"✅ Market closed — see you tomorrow!")
-        report.append(f"🌅 Pre-market briefing at 8:30am ET")
         report.append(f"{'='*45}")
 
         print("\n".join(report))
-        subject = f"📊 EOD Report — {now_et.strftime('%b %d')} | P&L: ${profit:+,.2f}"
+        subject = (f"📊 EOD Report — {now_et.strftime('%b %d')} | "
+                  f"P&L: ${profit:+,.2f} | Trades: {len(get_todays_trades())}")
         if send_email(subject, report):
             mark_sent_today("eod")
+        return
+
+    # ── PRE-MARKET — silent ───────────────────
+    if not market_open:
+        print(f"Pre-market — monitoring silently")
         return
 
     # ── MARKET IS OPEN ────────────────────────
@@ -822,15 +757,25 @@ def run():
     report.append(f"📅 {now_et.strftime('%A %B %d, %Y')}")
     report.append(f"⏰ {now_et.strftime('%I:%M %p')} ET")
     report.append(f"{'⚠️ EARLY CLOSE — 1pm ET' if early_close else '📅 Regular trading day'}")
-    report.append(f"💰 Budget: ${WEEKLY_BUDGET} | Stop: {STOP_LOSS*100}% | Target: {TAKE_PROFIT*100}%")
-    report.append(f"🧠 MA + RSI + Volume + Momentum + Finnhub + Earnings + Screener")
+    report.append(f"💰 Budget: ${WEEKLY_BUDGET} | "
+                 f"TP: {TAKE_PROFIT*100}% | SL: {STOP_LOSS*100}% | "
+                 f"Max loss/day: ${DAILY_LOSS_LIMIT}")
+    report.append(f"🧠 ORB + News Catalyst + Momentum Scalping")
     report.append("="*45)
+
+    # Daily loss limit check
+    if daily_loss_exceeded():
+        report.append(f"🚫 DAILY LOSS LIMIT ${DAILY_LOSS_LIMIT} REACHED")
+        report.append(f"   Bot stopped for today — protecting capital")
+        print("\n".join(report))
+        return
+
     report.append(f"🕐 Market {market_msg}")
+    report.append(f"🛡 Daily loss so far: ${get_daily_loss():.2f} / ${DAILY_LOSS_LIMIT}")
     report.append("="*45)
 
     # Get account
-    account = None
-    profit  = 0
+    profit = 0
     try:
         account   = get_account()
         portfolio = float(account["portfolio_value"])
@@ -842,7 +787,9 @@ def run():
     except Exception as e:
         report.append(f"⚠️ Account error: {e}")
         print("\n".join(report))
-        send_email(f"🚨 Bot Error — {now_et.strftime('%b %d %I:%M %p')} ET", report, is_error=True)
+        send_email(
+            f"🚨 Bot Error — {now_et.strftime('%b %d %I:%M %p')} ET",
+            report, is_error=True)
         return
 
     # Get positions
@@ -853,133 +800,71 @@ def run():
         report.append(f"⚠️ Positions error: {e}")
         held = {}
 
-    # End of day — cancel orders + close positions
+    # End of day — close everything
     if is_end_of_day():
         close_time = "12:30pm" if early_close else "3:30pm"
-        report.append(f"\n⏰ {close_time} ET — End of day")
+        report.append(f"\n⏰ {close_time} — Closing all positions")
         close_all_positions(report)
         report.append(f"{'='*45}")
-        report.append(f"✅ Positions closed — awaiting market close")
+        report.append(f"✅ All positions closed — EOD email coming")
         report.append(f"{'='*45}")
         print("\n".join(report))
         return
 
-    budget_per_stock = round(WEEKLY_BUDGET / MAX_POSITIONS, 2)
-    report.append(f"📊 Per position: ${budget_per_stock:.2f}")
-    report.append("="*45)
+    # ── STRATEGY EXECUTION ────────────────────
 
-    # Screener
-    screener_stocks = screen_new_stocks(held, report)
-    full_watchlist  = list(WATCHLIST) + screener_stocks
-    report.append(f"\n🔍 SCANNING {len(full_watchlist)} STOCKS...\n")
+    buy_signals = []
 
-    buy_signals  = []
-    sell_signals = []
+    # ORB window — build ranges
+    if is_orb_window():
+        update_orb_ranges(report)
+        report.append(f"\n⏳ In opening range window — watching not trading")
+        print("\n".join(report))
+        return
 
-    for symbol in full_watchlist:
-        try:
-            a = full_analysis(symbol)
-            if not a:
-                continue
-            emoji = "🟢" if a["signal"] == "BUY" else "🔴" if a["signal"] == "SELL" else "⏳"
-            earnings_soon, e_msg = get_earnings_finnhub(symbol)
-            if a["signal"] == "BUY" and earnings_soon:
-                a["signal"] = "HOLD"
-                report.append(f"   ⚠️ {symbol} — BUY blocked: {e_msg}")
-            else:
-                report.append(f"   {emoji} {symbol} @ ${a['price']:.2f} | Score: {a['score']}/100 | Mom: {a['momentum']:+.2f}% | News: {a['news']}")
-            if a["signal"] == "BUY" and symbol not in held:
-                buy_signals.append(a)
-            elif a["signal"] == "SELL" and symbol in held:
-                sell_signals.append(symbol)
-        except Exception as e:
-            report.append(f"   ⚠️ {symbol}: {e}")
+    # After 9:30am — run all 3 strategies
 
-    # Position management
-    report.append(f"\n{'='*45}")
-    report.append(f"📦 POSITIONS")
-    report.append(f"{'='*45}")
+    # Manage existing positions first
+    sells, freed_cash = manage_positions(held, report)
+    cash += freed_cash
 
-    for symbol, pos in held.items():
-        try:
-            unrealized = float(pos["unrealized_pl"])
-            gain_pct   = float(pos["unrealized_plpc"])
-            if gain_pct >= TAKE_PROFIT:
-                success, pl = close_position_safely(symbol, pos["market_value"], unrealized)
-                if success:
-                    report.append(f"   💰 TAKE PROFIT {symbol}: +${unrealized:.2f} ({gain_pct*100:+.2f}%)")
-                else:
-                    report.append(f"   ⚠️ {symbol}: Could not close — check Alpaca")
-            elif gain_pct <= -STOP_LOSS:
-                success, pl = close_position_safely(symbol, pos["market_value"], unrealized)
-                if success:
-                    report.append(f"   🛑 STOP LOSS {symbol}: ${unrealized:.2f} ({gain_pct*100:+.2f}%)")
-                else:
-                    report.append(f"   ⚠️ {symbol}: Could not close — check Alpaca")
-            else:
-                report.append(f"   📦 {symbol}: ${unrealized:+.2f} ({gain_pct*100:+.2f}%) — holding")
-        except Exception as e:
-            report.append(f"   ⚠️ {symbol}: {e}")
+    # Strategy 1 — ORB Breakouts
+    orb_buys = check_orb_breakouts(held, cash, report)
+    buy_signals.extend(orb_buys)
 
-    # Sells
-    report.append(f"\n{'='*45}")
-    report.append(f"📤 SELLING")
-    report.append(f"{'='*45}")
-    sells = 0
-    for symbol in sell_signals:
-        if symbol in held:
-            try:
-                success, pl = close_position_safely(
-                    symbol, held[symbol]["market_value"],
-                    held[symbol]["unrealized_pl"])
-                if success:
-                    report.append(f"   🔴 SOLD {symbol}")
-                    sells += 1
-                else:
-                    report.append(f"   ⚠️ Could not sell {symbol}")
-            except Exception as e:
-                report.append(f"   ⚠️ {symbol}: {e}")
-    if sells == 0:
-        report.append(f"   — Nothing to sell")
+    # Strategy 2 — News Catalysts
+    news_buys = check_news_catalysts(held, report)
+    buy_signals.extend(news_buys)
 
-    # Buys
-    report.append(f"\n{'='*45}")
-    report.append(f"📥 BUYING")
-    report.append(f"{'='*45}")
-    buy_signals.sort(key=lambda x: x["score"], reverse=True)
-    buys = 0
-    for signal in buy_signals:
-        symbol = signal["symbol"]
-        if len(held) + buys >= MAX_POSITIONS:
-            report.append(f"   ⛔ Max positions — skipping {symbol}")
-            continue
-        if cash < budget_per_stock:
-            report.append(f"   ⚠️ Not enough cash")
-            continue
-        if budget_per_stock < MIN_ORDER:
-            continue
-        try:
-            result = place_fractional_order(symbol, budget_per_stock, "buy")
-            if result:
-                report.append(f"   📈 BOUGHT {symbol} @ ${signal['price']:.2f} | Score: {signal['score']} | Mom: {signal['momentum']:+.2f}%")
-                cash -= budget_per_stock
-                buys += 1
-        except Exception as e:
-            report.append(f"   ⚠️ {symbol}: {e}")
-    if buys == 0:
-        report.append(f"   — No strong signals this cycle")
+    # Strategy 3 — Momentum Scalps
+    mom_buys = check_momentum_scalps(held, report)
+    buy_signals.extend(mom_buys)
+
+    # Remove duplicates — keep highest score per symbol
+    seen     = {}
+    for b in buy_signals:
+        sym = b["symbol"]
+        if sym not in seen or b["score"] > seen[sym]["score"]:
+            seen[sym] = b
+    buy_signals = list(seen.values())
+
+    # Execute buys
+    buys, cash = execute_buys(buy_signals, held, cash, report)
 
     # Summary
     report.append(f"\n{'='*45}")
-    report.append(f"📊 SUMMARY")
+    report.append(f"📊 CYCLE SUMMARY")
     report.append(f"{'='*45}")
-    report.append(f"   Scanned:  {len(full_watchlist)} stocks")
-    report.append(f"   Bought:   {buys}")
-    report.append(f"   Sold:     {sells}")
-    report.append(f"   Held:     {len(held)}")
-    report.append(f"   P&L:      ${profit:+,.2f}")
+    report.append(f"   Positions held: {len(held)}")
+    report.append(f"   Buys this cycle: {buys}")
+    report.append(f"   Sells this cycle: {sells}")
+    report.append(f"   ORB signals: {len(orb_buys)}")
+    report.append(f"   News signals: {len(news_buys)}")
+    report.append(f"   Momentum signals: {len(mom_buys)}")
+    report.append(f"   P&L: ${profit:+,.2f}")
+    report.append(f"   Daily loss: ${get_daily_loss():.2f} / ${DAILY_LOSS_LIMIT}")
     report.append(f"{'='*45}")
-    report.append(f"✅ Next run in 10 mins")
+    report.append(f"✅ Next run in 1 min")
     report.append(f"{'='*45}")
 
     print("\n".join(report))
