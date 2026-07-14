@@ -172,16 +172,28 @@ def get_todays_trades():
 # =============================================
 # ALPACA API
 # =============================================
-def alpaca_request(method, endpoint, data=None):
-    url = f"{ALPACA_URL}{endpoint}"
-    req = urllib.request.Request(url, method=method)
-    req.add_header("APCA-API-KEY-ID", ALPACA_KEY)
-    req.add_header("APCA-API-SECRET-KEY", ALPACA_SECRET)
-    req.add_header("Content-Type", "application/json")
-    if data:
-        req.data = json.dumps(data).encode()
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read())
+def alpaca_request(method, endpoint, data=None, retries=3):
+    """Alpaca API with automatic retry on timeout"""
+    url        = f"{ALPACA_URL}{endpoint}"
+    last_error = None
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, method=method)
+            req.add_header("APCA-API-KEY-ID", ALPACA_KEY)
+            req.add_header("APCA-API-SECRET-KEY", ALPACA_SECRET)
+            req.add_header("Content-Type", "application/json")
+            if data:
+                req.data = json.dumps(data).encode()
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.loads(r.read())
+        except Exception as e:
+            last_error = e
+            if attempt < retries - 1:
+                wait = (attempt + 1) * 5  # 5s, 10s, 15s
+                print(f"⚠️ Alpaca attempt {attempt+1} failed — "
+                      f"retrying in {wait}s...")
+                time.sleep(wait)
+    raise last_error
 
 def get_account():
     return alpaca_request("GET", "/v2/account")
@@ -265,17 +277,22 @@ def close_all_positions(report):
 # =============================================
 # REAL-TIME DATA — ALPACA
 # =============================================
-def get_latest_price(symbol):
-    try:
-        url = f"https://data.alpaca.markets/v2/stocks/{symbol}/trades/latest"
-        req = urllib.request.Request(url)
-        req.add_header("APCA-API-KEY-ID", ALPACA_KEY)
-        req.add_header("APCA-API-SECRET-KEY", ALPACA_SECRET)
-        with urllib.request.urlopen(req, timeout=10) as r:
-            data = json.loads(r.read())
-        return float(data["trade"]["p"])
-    except Exception:
-        return get_price_yahoo(symbol)
+def get_latest_price(symbol, retries=3):
+    last_error = None
+    for attempt in range(retries):
+        try:
+            url = f"https://data.alpaca.markets/v2/stocks/{symbol}/trades/latest"
+            req = urllib.request.Request(url)
+            req.add_header("APCA-API-KEY-ID", ALPACA_KEY)
+            req.add_header("APCA-API-SECRET-KEY", ALPACA_SECRET)
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = json.loads(r.read())
+            return float(data["trade"]["p"])
+        except Exception as e:
+            last_error = e
+            if attempt < retries - 1:
+                time.sleep(3)
+    return get_price_yahoo(symbol)
 
 def get_price_yahoo(symbol):
     try:
@@ -289,23 +306,28 @@ def get_price_yahoo(symbol):
     except Exception:
         return None
 
-def get_bars(symbol, timeframe="1Min", limit=30):
-    try:
-        end   = datetime.now(ET)
-        start = end - timedelta(hours=2)
-        url   = (f"https://data.alpaca.markets/v2/stocks/{symbol}/bars"
-                 f"?timeframe={timeframe}"
-                 f"&start={start.strftime('%Y-%m-%dT%H:%M:%SZ')}"
-                 f"&end={end.strftime('%Y-%m-%dT%H:%M:%SZ')}"
-                 f"&limit={limit}")
-        req = urllib.request.Request(url)
-        req.add_header("APCA-API-KEY-ID", ALPACA_KEY)
-        req.add_header("APCA-API-SECRET-KEY", ALPACA_SECRET)
-        with urllib.request.urlopen(req, timeout=10) as r:
-            data = json.loads(r.read())
-        return data.get("bars", [])
-    except Exception:
-        return []
+def get_bars(symbol, timeframe="1Min", limit=30, retries=3):
+    last_error = None
+    for attempt in range(retries):
+        try:
+            end   = datetime.now(ET)
+            start = end - timedelta(hours=2)
+            url   = (f"https://data.alpaca.markets/v2/stocks/{symbol}/bars"
+                     f"?timeframe={timeframe}"
+                     f"&start={start.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+                     f"&end={end.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+                     f"&limit={limit}")
+            req = urllib.request.Request(url)
+            req.add_header("APCA-API-KEY-ID", ALPACA_KEY)
+            req.add_header("APCA-API-SECRET-KEY", ALPACA_SECRET)
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = json.loads(r.read())
+            return data.get("bars", [])
+        except Exception as e:
+            last_error = e
+            if attempt < retries - 1:
+                time.sleep(3)
+    return []
 
 # =============================================
 # STRATEGY 1 — OPENING RANGE BREAKOUT (ORB)
