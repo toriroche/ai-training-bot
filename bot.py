@@ -608,8 +608,175 @@ def check_momentum_scalps(held, report, score_threshold=85):
     return buys
 
 # =============================================
-# EARNINGS CHECK
+# EXPANDED MARKET SCREENER
+# Scans far beyond the watchlist
 # =============================================
+def screen_full_market(held, report):
+    """Scan entire market for best opportunities"""
+    report.append(f"\n🔭 FULL MARKET SCAN")
+    candidates = {}
+
+    # Source 1 — Top 50 day gainers (not just 10)
+    try:
+        url = ("https://query1.finance.yahoo.com/v1/finance/screener/"
+               "predefined/saved?scrIds=day_gainers&count=50")
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        quotes = (data.get("finance", {})
+                 .get("result", [{}])[0].get("quotes", []))
+        for q in quotes:
+            sym = q.get("symbol", "")
+            if sym and sym not in held:
+                candidates[sym] = {
+                    "change_pct": q.get("regularMarketChangePercent", 0),
+                    "volume":     q.get("regularMarketVolume", 0),
+                    "price":      q.get("regularMarketPrice", 0),
+                    "source":     "Day Gainer",
+                }
+        report.append(f"   📈 Day gainers: {len(quotes)} stocks")
+    except Exception as e:
+        report.append(f"   ⚠️ Day gainers: {e}")
+
+    # Source 2 — Top 50 most active by volume
+    try:
+        url = ("https://query1.finance.yahoo.com/v1/finance/screener/"
+               "predefined/saved?scrIds=most_actives&count=50")
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        quotes = (data.get("finance", {})
+                 .get("result", [{}])[0].get("quotes", []))
+        for q in quotes:
+            sym = q.get("symbol", "")
+            if sym and sym not in held:
+                if sym in candidates:
+                    candidates[sym]["source"] += " + Most Active"
+                else:
+                    candidates[sym] = {
+                        "change_pct": q.get("regularMarketChangePercent", 0),
+                        "volume":     q.get("regularMarketVolume", 0),
+                        "price":      q.get("regularMarketPrice", 0),
+                        "source":     "Most Active",
+                    }
+        report.append(f"   📊 Most active: {len(quotes)} stocks")
+    except Exception as e:
+        report.append(f"   ⚠️ Most active: {e}")
+
+    # Source 3 — Small cap gainers (underdogs!)
+    try:
+        url = ("https://query1.finance.yahoo.com/v1/finance/screener/"
+               "predefined/saved?scrIds=small_cap_gainers&count=25")
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        quotes = (data.get("finance", {})
+                 .get("result", [{}])[0].get("quotes", []))
+        for q in quotes:
+            sym = q.get("symbol", "")
+            if sym and sym not in held:
+                if sym in candidates:
+                    candidates[sym]["source"] += " + Small Cap"
+                else:
+                    candidates[sym] = {
+                        "change_pct": q.get("regularMarketChangePercent", 0),
+                        "volume":     q.get("regularMarketVolume", 0),
+                        "price":      q.get("regularMarketPrice", 0),
+                        "source":     "Small Cap Gainer",
+                    }
+        report.append(f"   🔬 Small cap gainers: {len(quotes)} stocks")
+    except Exception as e:
+        report.append(f"   ⚠️ Small cap: {e}")
+
+    # Source 4 — Growth technology stocks
+    try:
+        url = ("https://query1.finance.yahoo.com/v1/finance/screener/"
+               "predefined/saved?scrIds=growth_technology_stocks&count=25")
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        quotes = (data.get("finance", {})
+                 .get("result", [{}])[0].get("quotes", []))
+        for q in quotes:
+            sym = q.get("symbol", "")
+            if sym and sym not in held:
+                if sym in candidates:
+                    candidates[sym]["source"] += " + Growth Tech"
+                else:
+                    candidates[sym] = {
+                        "change_pct": q.get("regularMarketChangePercent", 0),
+                        "volume":     q.get("regularMarketVolume", 0),
+                        "price":      q.get("regularMarketPrice", 0),
+                        "source":     "Growth Tech",
+                    }
+        report.append(f"   💻 Growth tech: {len(quotes)} stocks")
+    except Exception as e:
+        report.append(f"   ⚠️ Growth tech: {e}")
+
+    # Filter — only stocks moving up with volume
+    strong_candidates = {
+        sym: data for sym, data in candidates.items()
+        if data["change_pct"] > 0.5      # Moving up 0.5%+
+        and data["volume"] > 100000       # Decent volume
+        and 1.00 < data["price"] < 500    # Reasonable price range
+        and sym not in WATCHLIST          # Not already in watchlist
+    }
+
+    report.append(f"   🎯 Strong candidates: {len(strong_candidates)} stocks")
+
+    # Analyze top candidates
+    new_stocks = []
+    sorted_candidates = sorted(
+        strong_candidates.items(),
+        key=lambda x: x[1]["change_pct"],
+        reverse=True
+    )[:20]  # Analyze top 20
+
+    for sym, info in sorted_candidates:
+        try:
+            bars = get_bars(sym, "1Min", 10)
+            if len(bars) < 5:
+                continue
+
+            prices     = [b["c"] for b in bars]
+            volumes    = [b["v"] for b in bars]
+            current    = prices[-1]
+            avg_vol    = sum(volumes[:-1]) / max(len(volumes)-1, 1)
+            latest_vol = volumes[-1]
+            move_5m    = (prices[-1] - prices[-5]) / prices[-5] * 100
+
+            score = 0
+            if info["change_pct"] > 3:   score += 40
+            elif info["change_pct"] > 1: score += 25
+            elif info["change_pct"] > 0.5: score += 15
+            if latest_vol > avg_vol * 2: score += 30
+            elif latest_vol > avg_vol:   score += 15
+            if move_5m > 0.3:            score += 20
+            if move_5m > 0.1:            score += 10
+
+            if score >= 50:
+                report.append(
+                    f"   🌟 {sym} @ ${current:.2f} | "
+                    f"+{info['change_pct']:.1f}% today | "
+                    f"Vol: {latest_vol/avg_vol:.1f}x | "
+                    f"Score: {score} | [{info['source']}]"
+                )
+                new_stocks.append({
+                    "symbol":   sym,
+                    "price":    current,
+                    "score":    score,
+                    "strategy": f"Screener ({info['source']})",
+                    "detail":   f"+{info['change_pct']:.1f}% today",
+                })
+        except Exception:
+            continue
+
+    if not new_stocks:
+        report.append("   — No strong candidates found beyond watchlist")
+
+    # Return as buy signals sorted by score
+    return sorted(new_stocks, key=lambda x: x["score"], reverse=True)[:SCREENER_MAX]
+
 def has_upcoming_earnings(symbol):
     try:
         if not FINNHUB_KEY:
@@ -1029,10 +1196,11 @@ def run():
     cash += freed_cash
 
     # Run strategies with goal-driven settings
-    orb_buys  = check_orb_breakouts(held, report, score_threshold)
-    news_buys = check_news_catalysts(held, report, score_threshold)
-    mom_buys  = check_momentum_scalps(held, report, score_threshold)
-    buy_signals = orb_buys + news_buys + mom_buys
+    orb_buys    = check_orb_breakouts(held, report, score_threshold)
+    news_buys   = check_news_catalysts(held, report, score_threshold)
+    mom_buys    = check_momentum_scalps(held, report, score_threshold)
+    market_buys = screen_full_market(held, report)
+    buy_signals = orb_buys + news_buys + mom_buys + market_buys
 
     # Remove duplicates
     seen = {}
@@ -1063,7 +1231,8 @@ def run():
     report.append(f"   Positions: {len(held)} held | {buys} bought | {sells} sold")
     report.append(f"   Rotated:   {rotated} weak → strong")
     report.append(f"   Signals:   {len(orb_buys)} ORB | "
-                 f"{len(news_buys)} News | {len(mom_buys)} Momentum")
+                 f"{len(news_buys)} News | {len(mom_buys)} Momentum | "
+                 f"{len(market_buys)} Market")
     report.append(f"   P&L:       ${profit:+,.2f}")
     report.append(f"   Peak:      ${peak:+,.2f}")
     report.append(f"   Floor:     ${floor:+,.2f}")
