@@ -551,8 +551,51 @@ def has_upcoming_earnings(symbol):
         return False, "Unknown"
 
 # =============================================
-# POSITION MANAGEMENT
+# POSITION ROTATION
+# Sells underperforming positions when
+# a stronger signal is available
 # =============================================
+def rotate_positions(held, buy_signals, report):
+    """Sell weak positions to make room for stronger signals"""
+    if not buy_signals or not held:
+        return held, 0
+
+    freed = 0
+    report.append(f"\n🔄 POSITION ROTATION CHECK")
+
+    # Get best available signal score
+    best_score = max(s["score"] for s in buy_signals)
+
+    for symbol, pos in list(held.items()):
+        if float(pos["market_value"]) < 1.00:
+            continue
+
+        unrealized = float(pos["unrealized_pl"])
+        gain_pct   = float(pos["unrealized_plpc"])
+        market_val = float(pos["market_value"])
+        curr_price = float(pos["current_price"])
+
+        # Rotate if position is losing AND better signal exists
+        # Better signal = 20+ points higher score
+        if gain_pct < 0 and best_score >= 85:
+            success, pl = close_position_safely(symbol, market_val, unrealized)
+            if success:
+                report.append(f"   🔄 ROTATED OUT {symbol}: "
+                             f"${unrealized:.2f} ({gain_pct*100:+.2f}%) "
+                             f"→ making room for score {best_score} signal")
+                log_trade(symbol, "SELL ROT", curr_price,
+                         market_val, unrealized, "Position Rotation")
+                if unrealized < 0:
+                    add_daily_loss(abs(unrealized))
+                del held[symbol]
+                freed += 1
+
+    if freed == 0:
+        report.append(f"   — No rotation needed this cycle")
+
+    return held, freed
+
+
 def manage_positions(held, report):
     sells = 0
     freed_cash = 0
@@ -870,6 +913,20 @@ def run():
     mom_buys  = check_momentum_scalps(held, report)
     buy_signals = orb_buys + news_buys + mom_buys
 
+    # Remove duplicates
+    seen = {}
+    for b in buy_signals:
+        sym = b["symbol"]
+        if sym not in seen or b["score"] > seen[sym]["score"]:
+            seen[sym] = b
+    buy_signals = list(seen.values())
+    buy_signals.sort(key=lambda x: x["score"], reverse=True)
+
+    # Rotate weak positions for stronger signals
+    if buy_signals:
+        held, rotated = rotate_positions(held, buy_signals, report)
+        cash += rotated * (WEEKLY_BUDGET / MAX_POSITIONS)
+
     # Execute buys
     buys, cash = execute_buys(buy_signals, held, cash, report)
 
@@ -878,6 +935,7 @@ def run():
     report.append(f"📊 CYCLE SUMMARY")
     report.append(f"{'='*45}")
     report.append(f"   Positions: {len(held)} held | {buys} bought | {sells} sold")
+    report.append(f"   Rotated:   {rotated if buy_signals else 0} weak → strong")
     report.append(f"   Signals:   {len(orb_buys)} ORB | "
                  f"{len(news_buys)} News | {len(mom_buys)} Momentum")
     report.append(f"   P&L:       ${profit:+,.2f}")
