@@ -850,12 +850,32 @@ def run():
         return
 
     # RULE 2 — Daily trailing profit stop (25% below peak)
+    # Close current losers but keep scanning for new opportunities
     if daily_trail_breached(profit):
-        report.append(f"🔒 PROFIT FLOOR HIT — locking in gains!")
+        report.append(f"🔒 PROFIT FLOOR HIT — closing losers, hunting recovery!")
         report.append(f"   Peak: ${peak:.2f} | Floor: ${floor:.2f} | Now: ${profit:.2f}")
-        report.append(f"   No more buys — protecting your profits!")
-        print("\n".join(report))
-        return
+        report.append(f"   Closing losing positions — will rebuy on strong signals")
+        try:
+            positions = get_positions()
+            for pos in positions:
+                sym      = pos["symbol"]
+                gain_pct = float(pos["unrealized_plpc"])
+                mval     = float(pos["market_value"])
+                pl       = float(pos["unrealized_pl"])
+                if mval < 1.00:
+                    continue
+                if gain_pct < 0:  # Only close losing positions
+                    success, closed_pl = close_position_safely(sym, mval, pl)
+                    if success:
+                        report.append(f"   🔄 Closed loser {sym}: "
+                                     f"${pl:.2f} ({gain_pct*100:+.2f}%)")
+                        add_daily_loss(abs(pl))
+                else:
+                    report.append(f"   ✅ Keeping winner {sym}: "
+                                 f"${pl:+.2f} ({gain_pct*100:+.2f}%)")
+        except Exception as e:
+            report.append(f"   Error: {e}")
+        report.append(f"   Continuing to scan for recovery opportunities...")
 
     # RULE 3 — Cumulative floor (never drop below previous day close)
     if cumulative_floor_breached(portfolio):
