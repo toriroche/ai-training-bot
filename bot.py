@@ -541,6 +541,8 @@ def manage_positions(held, report):
     report.append(f"\n📦 POSITION MANAGEMENT")
 
     for symbol, pos in held.items():
+        if float(pos["market_value"]) < 1.00:
+            continue  # Skip micro positions
         try:
             unrealized  = float(pos["unrealized_pl"])
             gain_pct    = float(pos["unrealized_plpc"])
