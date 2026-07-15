@@ -25,7 +25,7 @@ ALPHA_VANTAGE_KEY = os.environ.get("ALPHA_VANTAGE_API_KEY")
 # =============================================
 WEEKLY_BUDGET      = 100
 TAKE_PROFIT        = 0.0075
-STOP_LOSS          = 0.003
+STOP_LOSS          = 0.002
 DAILY_LOSS_LIMIT   = 2.00
 MAX_POSITIONS      = 5
 MIN_ORDER          = 1.00
@@ -1161,7 +1161,8 @@ def run():
     # Get positions
     try:
         positions = get_positions()
-        held      = {p["symbol"]: p for p in positions}
+        held      = {p["symbol"]: p for p in positions
+                    if float(p["market_value"]) >= 1.00}  # Auto-exclude micro positions
     except Exception as e:
         report.append(f"Positions error: {e}")
         held = {}
