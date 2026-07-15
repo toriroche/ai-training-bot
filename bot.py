@@ -26,12 +26,13 @@ ALPHA_VANTAGE_KEY = os.environ.get("ALPHA_VANTAGE_API_KEY")
 WEEKLY_BUDGET      = 100
 TAKE_PROFIT        = 0.0075   # 0.75%
 STOP_LOSS          = 0.003    # 0.3%
-DAILY_LOSS_LIMIT   = 2.00     # Stop trading if down $2
+DAILY_LOSS_LIMIT   = 2.00     # Stop if down $2 in a day
 MAX_POSITIONS      = 5
 MIN_ORDER          = 1.00
-MIN_MOMENTUM       = 0.003    # 0.3% move to trigger scalp
+MIN_MOMENTUM       = 0.005    # 0.5% move to trigger scalp
 EARNINGS_SAFE_DAYS = 5
 SCREENER_MAX       = 5
+PROFIT_TRAIL       = 0.25     # Stop if P&L drops 25% below daily peak
 ET                 = ZoneInfo("America/New_York")
 EARLY_CLOSE_DATES  = ["07-03", "07-04", "11-28", "12-24"]
 
@@ -41,6 +42,8 @@ ORB_FILE     = "/home/ubuntu/.orb_ranges"
 TRADES_FILE  = "/home/ubuntu/.bot_trades"
 LOSS_FILE    = "/home/ubuntu/.bot_daily_loss"
 EOD_DONE     = "/home/ubuntu/.bot_eod_done"
+PEAK_FILE    = "/home/ubuntu/.bot_peak_profit"
+FLOOR_FILE   = "/home/ubuntu/.bot_cumulative_floor"
 
 # =============================================
 # WATCHLIST
@@ -83,7 +86,6 @@ def is_end_of_day():
     return now_et >= market_close - timedelta(minutes=15)
 
 def eod_close_already_done():
-    """Prevent EOD close from running multiple times"""
     today = datetime.now(ET).strftime("%Y-%m-%d")
     try:
         with open(EOD_DONE, "r") as f:
@@ -108,6 +110,65 @@ def mark_sent_today(email_type="eod"):
     today = datetime.now(ET).strftime("%Y-%m-%d")
     with open(f"{SENT_FILE}_{email_type}", "w") as f:
         f.write(today)
+
+# =============================================
+# RULE 1 — DAILY TRAILING PROFIT STOP (25%)
+# Peak resets each day
+# If today's P&L drops 25% below today's peak → stop
+# =============================================
+def get_peak_profit():
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    try:
+        with open(PEAK_FILE, "r") as f:
+            data = json.load(f)
+        if data.get("date") != today:
+            return 0.0
+        return data.get("peak", 0.0)
+    except Exception:
+        return 0.0
+
+def update_peak_profit(current_pl):
+    today    = datetime.now(ET).strftime("%Y-%m-%d")
+    old_peak = get_peak_profit()
+    new_peak = max(old_peak, current_pl)
+    if new_peak > old_peak:
+        with open(PEAK_FILE, "w") as f:
+            json.dump({"date": today, "peak": round(new_peak, 4)}, f)
+    return new_peak
+
+def daily_trail_breached(current_pl):
+    peak = get_peak_profit()
+    if peak <= 0:
+        return False
+    floor = peak * (1 - PROFIT_TRAIL)
+    return current_pl < floor
+
+# =============================================
+# RULE 2 — CUMULATIVE FLOOR
+# Protects ALL previous days gains permanently
+# Never let account drop below yesterday's close
+# =============================================
+def get_cumulative_floor():
+    try:
+        with open(FLOOR_FILE, "r") as f:
+            data = json.load(f)
+        return data.get("floor", 100000.0)
+    except Exception:
+        return 100000.0
+
+def update_cumulative_floor(portfolio_value):
+    """Called at EOD — sets tomorrow's floor to today's closing value"""
+    current_floor = get_cumulative_floor()
+    new_floor     = max(current_floor, portfolio_value)
+    if new_floor > current_floor:
+        with open(FLOOR_FILE, "w") as f:
+            json.dump({"floor": round(new_floor, 4)}, f)
+        print(f"🔒 Cumulative floor updated: ${new_floor:,.2f}")
+    return new_floor
+
+def cumulative_floor_breached(portfolio_value):
+    floor = get_cumulative_floor()
+    return portfolio_value < floor
 
 # =============================================
 # DAILY LOSS TRACKING
@@ -147,13 +208,9 @@ def log_trade(symbol, action, price, amount, pl=0, strategy=""):
     except Exception:
         data = {"date": today, "trades": []}
     data["trades"].append({
-        "time":     now,
-        "symbol":   symbol,
-        "action":   action,
-        "price":    round(price, 2),
-        "amount":   round(amount, 2),
-        "pl":       round(pl, 4),
-        "strategy": strategy,
+        "time": now, "symbol": symbol, "action": action,
+        "price": round(price, 2), "amount": round(amount, 2),
+        "pl": round(pl, 4), "strategy": strategy,
     })
     with open(TRADES_FILE, "w") as f:
         json.dump(data, f)
@@ -170,10 +227,9 @@ def get_todays_trades():
         return []
 
 # =============================================
-# ALPACA API
+# ALPACA API — WITH RETRY
 # =============================================
 def alpaca_request(method, endpoint, data=None, retries=3):
-    """Alpaca API with automatic retry on timeout"""
     url        = f"{ALPACA_URL}{endpoint}"
     last_error = None
     for attempt in range(retries):
@@ -189,9 +245,8 @@ def alpaca_request(method, endpoint, data=None, retries=3):
         except Exception as e:
             last_error = e
             if attempt < retries - 1:
-                wait = (attempt + 1) * 5  # 5s, 10s, 15s
-                print(f"⚠️ Alpaca attempt {attempt+1} failed — "
-                      f"retrying in {wait}s...")
+                wait = (attempt + 1) * 5
+                print(f"⚠️ Alpaca attempt {attempt+1} failed — retrying in {wait}s...")
                 time.sleep(wait)
     raise last_error
 
@@ -212,11 +267,8 @@ def place_order(symbol, dollars, side):
     if dollars < MIN_ORDER:
         return None
     return alpaca_request("POST", "/v2/orders", {
-        "symbol":        symbol,
-        "notional":      str(round(dollars, 2)),
-        "side":          side,
-        "type":          "market",
-        "time_in_force": "day",
+        "symbol": symbol, "notional": str(round(dollars, 2)),
+        "side": side, "type": "market", "time_in_force": "day",
     })
 
 def close_position_safely(symbol, market_value, unrealized_pl):
@@ -235,16 +287,13 @@ def close_position_safely(symbol, market_value, unrealized_pl):
     return False, 0
 
 def close_all_positions(report):
-    """Close all positions ONCE at end of day"""
     if eod_close_already_done():
         report.append(f"   ✅ EOD close already completed today")
         return 0
-
     report.append(f"\n🔔 Closing all positions for the day")
     cancelled = cancel_all_orders()
     report.append(f"   📋 Cancelled {cancelled} pending orders")
     time.sleep(2)
-
     try:
         positions = get_positions()
         if not positions:
@@ -257,6 +306,8 @@ def close_all_positions(report):
             pl     = float(pos["unrealized_pl"])
             price  = float(pos["current_price"])
             mval   = float(pos["market_value"])
+            if mval < 1.00:
+                continue
             success, closed_pl = close_position_safely(symbol, mval, pl)
             if success:
                 total_pl += closed_pl
@@ -268,17 +319,16 @@ def close_all_positions(report):
             else:
                 report.append(f"   ⚠️ Could not close {symbol}")
         report.append(f"   📊 Total EOD P&L: ${total_pl:+.2f}")
-        mark_eod_done()  # Mark done so it never runs again today
+        mark_eod_done()
         return total_pl
     except Exception as e:
         report.append(f"   ⚠️ Error: {e}")
         return 0
 
 # =============================================
-# REAL-TIME DATA — ALPACA
+# REAL-TIME DATA — ALPACA WITH RETRY
 # =============================================
 def get_latest_price(symbol, retries=3):
-    last_error = None
     for attempt in range(retries):
         try:
             url = f"https://data.alpaca.markets/v2/stocks/{symbol}/trades/latest"
@@ -288,8 +338,7 @@ def get_latest_price(symbol, retries=3):
             with urllib.request.urlopen(req, timeout=10) as r:
                 data = json.loads(r.read())
             return float(data["trade"]["p"])
-        except Exception as e:
-            last_error = e
+        except Exception:
             if attempt < retries - 1:
                 time.sleep(3)
     return get_price_yahoo(symbol)
@@ -307,7 +356,6 @@ def get_price_yahoo(symbol):
         return None
 
 def get_bars(symbol, timeframe="1Min", limit=30, retries=3):
-    last_error = None
     for attempt in range(retries):
         try:
             end   = datetime.now(ET)
@@ -323,14 +371,13 @@ def get_bars(symbol, timeframe="1Min", limit=30, retries=3):
             with urllib.request.urlopen(req, timeout=10) as r:
                 data = json.loads(r.read())
             return data.get("bars", [])
-        except Exception as e:
-            last_error = e
+        except Exception:
             if attempt < retries - 1:
                 time.sleep(3)
     return []
 
 # =============================================
-# STRATEGY 1 — OPENING RANGE BREAKOUT (ORB)
+# STRATEGY 1 — OPENING RANGE BREAKOUT
 # =============================================
 def update_orb_ranges(report):
     today = datetime.now(ET).strftime("%Y-%m-%d")
@@ -341,7 +388,6 @@ def update_orb_ranges(report):
             orb_data = {"date": today, "ranges": {}}
     except Exception:
         orb_data = {"date": today, "ranges": {}}
-
     report.append(f"\n📐 BUILDING OPENING RANGE (9:00-9:30am)")
     for symbol in WATCHLIST:
         try:
@@ -354,16 +400,13 @@ def update_orb_ranges(report):
                         if b.get("t", "") >= open_time.strftime("%Y-%m-%dT%H:%M")]
             if not orb_bars:
                 continue
-            highs = [b["h"] for b in orb_bars]
-            lows  = [b["l"] for b in orb_bars]
             orb_data["ranges"][symbol] = {
-                "high":   max(highs),
-                "low":    min(lows),
+                "high":   max(b["h"] for b in orb_bars),
+                "low":    min(b["l"] for b in orb_bars),
                 "volume": sum(b.get("v", 0) for b in orb_bars),
             }
         except Exception:
             continue
-
     with open(ORB_FILE, "w") as f:
         json.dump(orb_data, f)
     report.append(f"   ✅ Ranges set for {len(orb_data['ranges'])} stocks")
@@ -380,33 +423,25 @@ def check_orb_breakouts(held, report):
         ranges = orb_data.get("ranges", {})
     except Exception:
         return buys
-
     report.append(f"\n📐 ORB BREAKOUT SCAN")
     for symbol, r in ranges.items():
         if symbol in held:
             continue
         try:
-            price    = get_latest_price(symbol)
+            price        = get_latest_price(symbol)
             if not price:
                 continue
-            orb_high = r["high"]
+            orb_high     = r["high"]
             breakout_pct = ((price - orb_high) / orb_high) * 100
-
-            # Stronger signal — need 0.15% above ORB high not just 0.1%
             if price > orb_high * 1.0015:
                 report.append(f"   🚀 {symbol} @ ${price:.2f} "
                              f"broke ORB ${orb_high:.2f} (+{breakout_pct:.2f}%)")
-                buys.append({
-                    "symbol":   symbol,
-                    "price":    price,
-                    "score":    90,
-                    "strategy": "ORB Breakout",
-                    "detail":   f"+{breakout_pct:.2f}% above ORB",
-                })
+                buys.append({"symbol": symbol, "price": price,
+                            "score": 90, "strategy": "ORB Breakout",
+                            "detail": f"+{breakout_pct:.2f}% above ORB"})
             else:
                 report.append(f"   ⏳ {symbol} @ ${price:.2f} | "
-                             f"ORB: ${orb_high:.2f} | "
-                             f"{breakout_pct:+.2f}%")
+                             f"ORB: ${orb_high:.2f} | {breakout_pct:+.2f}%")
         except Exception:
             continue
     return buys
@@ -417,15 +452,14 @@ def check_orb_breakouts(held, report):
 def check_news_catalysts(held, report):
     if not FINNHUB_KEY:
         return []
-    buys = []
+    buys  = []
+    today = datetime.now(ET)
     report.append(f"\n📰 NEWS CATALYST SCAN")
-    today    = datetime.now(ET)
-    week_ago = today - timedelta(hours=4)
-
     for symbol in WATCHLIST[:8]:
         if symbol in held:
             continue
         try:
+            week_ago = today - timedelta(hours=4)
             url = (f"https://finnhub.io/api/v1/company-news?symbol={symbol}"
                    f"&from={week_ago.strftime('%Y-%m-%d')}"
                    f"&to={today.strftime('%Y-%m-%d')}"
@@ -433,34 +467,25 @@ def check_news_catalysts(held, report):
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=10) as r:
                 articles = json.loads(r.read())
-
             if not articles:
                 continue
-
             positive_words = ["beat","surge","soar","jump","record","upgrade",
                             "profit","growth","strong","win","boost","rally"]
             negative_words = ["miss","drop","fall","plunge","loss","downgrade",
                             "weak","decline","crash","warn","cut","layoff"]
-
             recent = articles[:5]
             pos = sum(1 for a in recent for w in positive_words
                      if w in a.get("headline", "").lower())
             neg = sum(1 for a in recent for w in negative_words
                      if w in a.get("headline", "").lower())
-
-            # Stronger signal — need pos >= 3 not just 2
             if pos > neg and pos >= 3:
                 price = get_latest_price(symbol)
                 if price:
                     headline = recent[0].get("headline", "")[:60]
                     report.append(f"   📢 {symbol} @ ${price:.2f} — {headline}...")
-                    buys.append({
-                        "symbol":   symbol,
-                        "price":    price,
-                        "score":    85,
-                        "strategy": "News Catalyst",
-                        "detail":   headline,
-                    })
+                    buys.append({"symbol": symbol, "price": price,
+                                "score": 85, "strategy": "News Catalyst",
+                                "detail": headline})
             else:
                 report.append(f"   — {symbol}: no strong catalyst")
         except Exception:
@@ -473,7 +498,6 @@ def check_news_catalysts(held, report):
 def check_momentum_scalps(held, report):
     buys = []
     report.append(f"\n⚡ MOMENTUM SCALP SCAN")
-
     for symbol in WATCHLIST:
         if symbol in held:
             continue
@@ -481,27 +505,21 @@ def check_momentum_scalps(held, report):
             bars = get_bars(symbol, "1Min", 10)
             if len(bars) < 6:
                 continue
-
-            prices  = [b["c"] for b in bars]
-            volumes = [b["v"] for b in bars]
+            prices       = [b["c"] for b in bars]
+            volumes      = [b["v"] for b in bars]
             current      = prices[-1]
             price_5m_ago = prices[-5]
             avg_volume   = sum(volumes[:-1]) / max(len(volumes)-1, 1)
             latest_vol   = volumes[-1]
             move_pct     = (current - price_5m_ago) / price_5m_ago
-
-            # Stronger signal — need 0.5% move not 0.3% AND 1.5x volume
-            if move_pct >= 0.005 and latest_vol > avg_volume * 1.5:
+            if move_pct >= MIN_MOMENTUM and latest_vol > avg_volume * 1.5:
                 report.append(f"   ⚡ {symbol} @ ${current:.2f} "
-                             f"+{move_pct*100:.2f}% in 5min | "
-                             f"Vol: {latest_vol/avg_volume:.1f}x avg")
-                buys.append({
-                    "symbol":   symbol,
-                    "price":    current,
-                    "score":    70 + min(int(move_pct * 1000), 20),
-                    "strategy": "Momentum Scalp",
-                    "detail":   f"+{move_pct*100:.2f}% in 5min",
-                })
+                             f"+{move_pct*100:.2f}% | "
+                             f"Vol: {latest_vol/avg_volume:.1f}x")
+                buys.append({"symbol": symbol, "price": current,
+                            "score": 70 + min(int(move_pct * 1000), 20),
+                            "strategy": "Momentum Scalp",
+                            "detail": f"+{move_pct*100:.2f}% in 5min"})
             else:
                 report.append(f"   ⏳ {symbol} @ ${current:.2f} | "
                              f"Move: {move_pct*100:+.2f}%")
@@ -536,19 +554,17 @@ def has_upcoming_earnings(symbol):
 # POSITION MANAGEMENT
 # =============================================
 def manage_positions(held, report):
-    sells      = 0
+    sells = 0
     freed_cash = 0
     report.append(f"\n📦 POSITION MANAGEMENT")
-
     for symbol, pos in held.items():
         if float(pos["market_value"]) < 1.00:
             continue  # Skip micro positions
         try:
-            unrealized  = float(pos["unrealized_pl"])
-            gain_pct    = float(pos["unrealized_plpc"])
-            market_val  = float(pos["market_value"])
-            curr_price  = float(pos["current_price"])
-
+            unrealized = float(pos["unrealized_pl"])
+            gain_pct   = float(pos["unrealized_plpc"])
+            market_val = float(pos["market_value"])
+            curr_price = float(pos["current_price"])
             if gain_pct >= TAKE_PROFIT:
                 success, pl = close_position_safely(symbol, market_val, unrealized)
                 if success:
@@ -558,7 +574,6 @@ def manage_positions(held, report):
                              market_val, unrealized, "Take Profit")
                     freed_cash += market_val
                     sells += 1
-
             elif gain_pct <= -STOP_LOSS:
                 success, pl = close_position_safely(symbol, market_val, unrealized)
                 if success:
@@ -569,15 +584,12 @@ def manage_positions(held, report):
                     add_daily_loss(abs(unrealized))
                     freed_cash += market_val
                     sells += 1
-
             else:
                 report.append(f"   📦 {symbol}: ${unrealized:+.2f} "
                              f"({gain_pct*100:+.2f}%) — holding | "
-                             f"Target: +{TAKE_PROFIT*100}% "
-                             f"Stop: -{STOP_LOSS*100}%")
+                             f"TP: +{TAKE_PROFIT*100}% SL: -{STOP_LOSS*100}%")
         except Exception as e:
             report.append(f"   ⚠️ {symbol}: {e}")
-
     return sells, freed_cash
 
 # =============================================
@@ -587,39 +599,31 @@ def execute_buys(buy_signals, held, cash, report):
     buys = 0
     buy_signals.sort(key=lambda x: x["score"], reverse=True)
     report.append(f"\n📥 BUYING")
-
-    # Remove duplicates
     seen = {}
     for b in buy_signals:
         sym = b["symbol"]
         if sym not in seen or b["score"] > seen[sym]["score"]:
             seen[sym] = b
     buy_signals = list(seen.values())
-
     for signal in buy_signals:
         symbol   = signal["symbol"]
         strategy = signal["strategy"]
-
         if len(held) + buys >= MAX_POSITIONS:
             report.append(f"   ⛔ Max {MAX_POSITIONS} positions — skipping {symbol}")
             continue
         if symbol in held:
             continue
         if daily_loss_exceeded():
-            report.append(f"   🚫 Daily loss limit ${DAILY_LOSS_LIMIT} reached — "
-                         f"no more buys today")
+            report.append(f"   🚫 Daily loss limit reached — no more buys")
             break
-
         earnings, e_msg = has_upcoming_earnings(symbol)
         if earnings:
             report.append(f"   ⚠️ {symbol} blocked — {e_msg}")
             continue
-
         budget = round(WEEKLY_BUDGET / MAX_POSITIONS, 2)
         if cash < budget or budget < MIN_ORDER:
             report.append(f"   ⚠️ Not enough cash")
             continue
-
         try:
             result = place_order(symbol, budget, "buy")
             if result:
@@ -630,10 +634,8 @@ def execute_buys(buy_signals, held, cash, report):
                 buys += 1
         except Exception as e:
             report.append(f"   ⚠️ {symbol}: {e}")
-
     if buys == 0:
         report.append(f"   — No buys this cycle")
-
     return buys, cash
 
 # =============================================
@@ -683,14 +685,14 @@ def run():
     weekday     = now_et.weekday()
     early_close = is_early_close()
 
-    # ── WEEKEND — silent ──────────────────────
+    # Weekend — silent
     if weekday >= 5:
         print(f"Weekend — bot monitoring silently")
         return
 
     market_open, market_msg = is_market_open()
 
-    # ── AFTER MARKET CLOSE — send ONE EOD email ──
+    # After market close — send ONE EOD email
     if not market_open and now_et.hour >= 9:
         if already_sent_today("eod"):
             print(f"EOD email already sent — sleeping")
@@ -709,20 +711,21 @@ def run():
             portfolio = float(account["portfolio_value"])
             cash      = float(account["cash"])
             profit    = portfolio - 100000
-            report.append(f"💼 Portfolio: ${portfolio:,.2f}")
-            report.append(f"💵 Cash:      ${cash:,.2f}")
-            report.append(f"📈 Total P&L: ${profit:+,.2f}")
+            report.append(f"💼 Portfolio:  ${portfolio:,.2f}")
+            report.append(f"💵 Cash:       ${cash:,.2f}")
+            report.append(f"📈 Total P&L:  ${profit:+,.2f}")
+            report.append(f"🏆 Peak today: ${get_peak_profit():+,.2f}")
+            report.append(f"🔒 Cum. floor: ${get_cumulative_floor():,.2f}")
         except Exception as e:
             report.append(f"⚠️ Account error: {e}")
 
-        # Today's trades
+        # Today's trades — meaningful only
         trades = get_todays_trades()
         if trades:
             wins   = [t for t in trades if t.get("pl", 0) > 0]
             losses = [t for t in trades if t.get("pl", 0) < 0]
             report.append(f"\n📋 TODAY'S TRADES ({len(trades)} total):")
             report.append(f"   ✅ Wins: {len(wins)} | ❌ Losses: {len(losses)}")
-            # Only show meaningful trades not EOD closes
             meaningful = [t for t in trades if "EOD" not in t.get("action", "")]
             for t in meaningful:
                 pl_str = f"${t['pl']:+.2f}" if t['pl'] != 0 else ""
@@ -731,38 +734,28 @@ def run():
         else:
             report.append(f"\n📋 No trades executed today")
 
-        # Earnings tomorrow
-        tomorrow = (now_et + timedelta(days=1)).strftime("%Y-%m-%d")
-        earnings_tmrw = []
-        for symbol in WATCHLIST[:8]:
-            try:
-                has_e, e_msg = has_upcoming_earnings(symbol)
-                if has_e and tomorrow in e_msg:
-                    earnings_tmrw.append(symbol)
-            except Exception:
-                continue
-        if earnings_tmrw:
-            report.append(f"\n⚠️ EARNINGS TOMORROW — Bot will avoid:")
-            for s in earnings_tmrw:
-                report.append(f"   🚫 {s}")
-
         daily_loss = get_daily_loss()
-        report.append(f"\n🛡 Daily loss: ${daily_loss:.2f} / ${DAILY_LOSS_LIMIT:.2f}")
+        report.append(f"\n🛡 Daily loss:  ${daily_loss:.2f} / ${DAILY_LOSS_LIMIT:.2f}")
         report.append(f"\n{'='*45}")
         report.append(f"✅ Market closed — see you tomorrow!")
         report.append(f"{'='*45}")
 
         print("\n".join(report))
-        trades    = get_todays_trades()
-        wins      = len([t for t in trades if t.get("pl", 0) > 0])
-        subject   = (f"📊 EOD Report — {now_et.strftime('%b %d')} | "
-                    f"P&L: ${profit:+,.2f} | "
-                    f"Trades: {len(trades)} | Wins: {wins}")
+
+        # Update cumulative floor with today's closing value
+        update_cumulative_floor(portfolio)
+
+        trades  = get_todays_trades()
+        wins    = len([t for t in trades if t.get("pl", 0) > 0])
+        subject = (f"📊 EOD Report — {now_et.strftime('%b %d')} | "
+                  f"P&L: ${profit:+,.2f} | "
+                  f"Peak: ${get_peak_profit():+,.2f} | "
+                  f"Trades: {len(trades)} | Wins: {wins}")
         if send_email(subject, report):
             mark_sent_today("eod")
         return
 
-    # ── PRE-MARKET — silent ───────────────────
+    # Pre-market — silent
     if not market_open:
         print(f"Pre-market — monitoring silently")
         return
@@ -776,36 +769,61 @@ def run():
     report.append(f"💰 Budget: ${WEEKLY_BUDGET} | "
                  f"TP: {TAKE_PROFIT*100}% | "
                  f"SL: {STOP_LOSS*100}% | "
-                 f"Max loss/day: ${DAILY_LOSS_LIMIT}")
+                 f"Max loss: ${DAILY_LOSS_LIMIT}")
     report.append(f"🧠 ORB + News Catalyst + Momentum Scalping")
     report.append("="*45)
 
-    # Daily loss limit check
-    if daily_loss_exceeded():
-        report.append(f"🚫 DAILY LOSS LIMIT ${DAILY_LOSS_LIMIT} REACHED — "
-                     f"bot stopped for today")
-        print("\n".join(report))
-        return
-
-    report.append(f"🕐 Market {market_msg}")
-    report.append(f"🛡 Daily loss: ${get_daily_loss():.2f} / ${DAILY_LOSS_LIMIT}")
-    report.append("="*45)
-
-    # Get account
-    profit = 0
+    # Get account first
+    profit    = 0
+    portfolio = 100000
     try:
         account   = get_account()
         portfolio = float(account["portfolio_value"])
         cash      = float(account["cash"])
         profit    = portfolio - 100000
-        report.append(f"💼 Portfolio: ${portfolio:,.2f}")
-        report.append(f"💵 Cash:      ${cash:,.2f}")
-        report.append(f"📈 P&L:       ${profit:+,.2f}")
     except Exception as e:
         report.append(f"⚠️ Account error: {e}")
         print("\n".join(report))
-        mark_sent_today("error")  # Silent — no error email spam
+        mark_sent_today("error")
         return
+
+    # Update peak profit
+    peak  = update_peak_profit(profit)
+    floor = peak * (1 - PROFIT_TRAIL)
+
+    report.append(f"🕐 Market {market_msg}")
+    report.append(f"💼 Portfolio: ${portfolio:,.2f}")
+    report.append(f"💵 Cash:      ${cash:,.2f}")
+    report.append(f"📈 P&L:       ${profit:+,.2f}")
+    report.append(f"🏆 Peak:      ${peak:+,.2f}")
+    report.append(f"🔒 Floor:     ${floor:+,.2f} (25% below peak)")
+    report.append(f"🛡 Cum. floor: ${get_cumulative_floor():,.2f}")
+    report.append("="*45)
+
+    # RULE 1 — Daily loss limit
+    if daily_loss_exceeded():
+        report.append(f"🚫 DAILY LOSS LIMIT ${DAILY_LOSS_LIMIT} REACHED — stopped")
+        print("\n".join(report))
+        return
+
+    # RULE 2 — Daily trailing profit stop (25% below peak)
+    if daily_trail_breached(profit):
+        report.append(f"🔒 PROFIT FLOOR HIT — locking in gains!")
+        report.append(f"   Peak: ${peak:.2f} | Floor: ${floor:.2f} | Now: ${profit:.2f}")
+        report.append(f"   No more buys — protecting your profits!")
+        print("\n".join(report))
+        return
+
+    # RULE 3 — Cumulative floor (never drop below previous day close)
+    if cumulative_floor_breached(portfolio):
+        cum_floor = get_cumulative_floor()
+        report.append(f"🔒 CUMULATIVE FLOOR HIT — protecting all-time gains!")
+        report.append(f"   Floor: ${cum_floor:,.2f} | Now: ${portfolio:,.2f}")
+        report.append(f"   No more buys — protecting previous days profits!")
+        print("\n".join(report))
+        return
+
+    report.append(f"🛡 Daily loss: ${get_daily_loss():.2f} / ${DAILY_LOSS_LIMIT}")
 
     # Get positions
     try:
@@ -834,8 +852,7 @@ def run():
     report.append(f"📊 Per position: ${budget_per_stock:.2f}")
     report.append("="*45)
 
-    # ORB window — build ranges, don't trade yet
-    now_et  = datetime.now(ET)
+    # ORB window — build ranges, don't trade
     orb_end = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
     if now_et < orb_end:
         update_orb_ranges(report)
@@ -848,13 +865,10 @@ def run():
     cash += freed_cash
 
     # Run all 3 strategies
-    buy_signals = []
-    orb_buys    = check_orb_breakouts(held, report)
-    news_buys   = check_news_catalysts(held, report)
-    mom_buys    = check_momentum_scalps(held, report)
-    buy_signals.extend(orb_buys)
-    buy_signals.extend(news_buys)
-    buy_signals.extend(mom_buys)
+    orb_buys  = check_orb_breakouts(held, report)
+    news_buys = check_news_catalysts(held, report)
+    mom_buys  = check_momentum_scalps(held, report)
+    buy_signals = orb_buys + news_buys + mom_buys
 
     # Execute buys
     buys, cash = execute_buys(buy_signals, held, cash, report)
@@ -867,6 +881,8 @@ def run():
     report.append(f"   Signals:   {len(orb_buys)} ORB | "
                  f"{len(news_buys)} News | {len(mom_buys)} Momentum")
     report.append(f"   P&L:       ${profit:+,.2f}")
+    report.append(f"   Peak:      ${peak:+,.2f}")
+    report.append(f"   Floor:     ${floor:+,.2f}")
     report.append(f"   Daily loss: ${get_daily_loss():.2f} / ${DAILY_LOSS_LIMIT}")
     report.append(f"{'='*45}")
     report.append(f"✅ Next run in 1 min")
