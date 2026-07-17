@@ -159,6 +159,20 @@ def get_peak_profit():
 def update_peak_profit(current_pl):
     today    = datetime.now(ET).strftime("%Y-%m-%d")
     old_peak = get_peak_profit()
+    # Initialize peak on first read of day even if negative
+    try:
+        with open(PEAK_FILE, "r") as f:
+            data = json.load(f)
+        initialized = data.get("date") == today
+    except Exception:
+        initialized = False
+
+    if not initialized:
+        # First read of the day — set peak to current P&L
+        with open(PEAK_FILE, "w") as f:
+            json.dump({"date": today, "peak": round(current_pl, 4)}, f)
+        return current_pl
+
     new_peak = max(old_peak, current_pl)
     if new_peak > old_peak:
         with open(PEAK_FILE, "w") as f:
@@ -390,11 +404,13 @@ def get_bars(symbol, timeframe="1Min", limit=30):
 # =============================================
 def update_orb_ranges(report):
     today = datetime.now(ET).strftime("%Y-%m-%d")
+    # Always start fresh each day
     try:
         with open(ORB_FILE, "r") as f:
             orb_data = json.load(f)
         if orb_data.get("date") != today:
             orb_data = {"date": today, "ranges": {}}
+            print("ORB ranges reset for new day")
     except Exception:
         orb_data = {"date": today, "ranges": {}}
     for symbol in WATCHLIST:
@@ -535,9 +551,9 @@ def screen_full_market(held, report):
     candidates = {}
 
     for scrId, label, count in [
-        ("day_gainers",   "Day gainers",   50),
-        ("most_actives",  "Most active",   50),
-        ("small_cap_gainers", "Small caps", 25),
+        ("day_gainers",       "Day Gainers",  50),
+        ("most_actives",      "Most Active",  50),
+        ("small_cap_gainers", "Small Caps",   25),
     ]:
         try:
             url = (f"https://query1.finance.yahoo.com/v1/finance/screener/"
@@ -547,6 +563,7 @@ def screen_full_market(held, report):
                 data = json.loads(r.read())
             quotes = (data.get("finance", {})
                      .get("result", [{}])[0].get("quotes", []))
+            added = 0
             for q in quotes:
                 sym = q.get("symbol", "")
                 if sym and sym not in held and sym not in WATCHLIST:
@@ -557,16 +574,20 @@ def screen_full_market(held, report):
                             "price":      q.get("regularMarketPrice", 0),
                             "source":     label,
                         }
-            report.append(f"   📊 {label}: {len(quotes)} stocks")
+                        added += 1
+                    else:
+                        candidates[sym]["source"] += f" + {label}"
+            report.append(f"   📊 {label}: {len(quotes)} scanned, {added} new candidates")
         except Exception as e:
             report.append(f"   ⚠️ {label}: {e}")
 
-    # Filter strong candidates
+    # Filter — only stocks with meaningful daily gain AND volume
+    # Cap at 5% max gain — avoid stocks already at peak
     strong = {
         sym: d for sym, d in candidates.items()
-        if d["change_pct"] > 1.0
-        and d["volume"] > 200000
-        and 2.00 < d["price"] < 500
+        if 0.5 < d["change_pct"] < 5.0   # Between 0.5% and 5% — not at peak
+        and d["volume"] > 200000           # Decent volume
+        and 2.00 < d["price"] < 500        # Reasonable price
     }
 
     new_stocks = []
@@ -578,35 +599,64 @@ def screen_full_market(held, report):
 
     for sym, info in sorted_candidates:
         try:
-            bars = get_bars(sym, "1Min", 10)
-            if len(bars) < 5:
+            # Use MA/RSI signals — same as original bot
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=3mo"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = json.loads(r.read())
+            result  = data["chart"]["result"][0]
+            quotes  = result["indicators"]["quote"][0]
+            prices  = [p for p in quotes["close"]  if p is not None]
+            volumes = [v for v in quotes["volume"] if v is not None]
+
+            if len(prices) < 20:
                 continue
-            prices     = [b["c"] for b in bars]
-            volumes    = [b["v"] for b in bars]
-            current    = prices[-1]
-            avg_vol    = sum(volumes[:-1]) / max(len(volumes)-1, 1)
+
+            # MA signal
+            import pandas as pd
+            df = pd.DataFrame(prices, columns=["close"])
+            df["short"] = df["close"].rolling(5).mean()
+            df["long"]  = df["close"].rolling(15).mean()
+            df["mom"]   = df["close"].pct_change(3)
+            l = df.iloc[-1]
+            p = df.iloc[-2]
+
+            ma_buy = (p["short"] <= p["long"] and l["short"] > l["long"] and l["mom"] > 0) or \
+                     (l["mom"] > 0.02 and l["short"] > l["long"])
+
+            # RSI
+            delta    = df["close"].diff()
+            gain     = delta.where(delta > 0, 0)
+            loss     = -delta.where(delta < 0, 0)
+            avg_gain = gain.rolling(10).mean()
+            avg_loss = loss.rolling(10).mean()
+            rs       = avg_gain / avg_loss
+            rsi_val  = round((100 - (100 / (1 + rs))).iloc[-1], 2)
+
+            # Volume
+            avg_vol    = sum(volumes[-20:]) / 20
             latest_vol = volumes[-1]
-            move_5m    = (prices[-1] - prices[-5]) / prices[-5] * 100
+            vol_ok     = latest_vol > avg_vol * 1.5
 
             score = 0
-            if info["change_pct"] > 5:   score += 40
-            elif info["change_pct"] > 2: score += 25
-            else:                        score += 15
-            if latest_vol > avg_vol * 2: score += 30
-            elif latest_vol > avg_vol:   score += 15
-            if move_5m > 0.3:            score += 20
+            if ma_buy:      score += 35
+            if rsi_val < 35: score += 25
+            elif rsi_val < 45: score += 12
+            if vol_ok:      score += 20
 
-            if score >= 50:
+            if score >= 55:
+                current = prices[-1]
                 report.append(
                     f"   🌟 {sym} @ ${current:.2f} | "
-                    f"+{info['change_pct']:.1f}% | "
-                    f"Score: {score} | [{info['source']}]"
+                    f"+{info['change_pct']:.1f}% today | "
+                    f"Score: {score} | RSI: {rsi_val} | [{info['source']}]"
                 )
                 new_stocks.append({
                     "symbol":   sym,
                     "price":    current,
                     "score":    score,
                     "strategy": f"Screener ({info['source']})",
+                    "momentum": info["change_pct"],
                 })
         except Exception:
             continue
@@ -725,7 +775,11 @@ def execute_buys(buy_signals, held, cash, report):
                 cash -= budget
                 buys += 1
         except Exception as e:
-            report.append(f"   ⚠️ {symbol}: {e}")
+            err = str(e).lower()
+            if "403" in err or "forbidden" in err or "not tradable" in err:
+                report.append(f"   ⚠️ {symbol}: Not tradeable on Alpaca — skipping")
+            else:
+                report.append(f"   ⚠️ {symbol}: {e}")
     if buys == 0:
         report.append("   — No buys this cycle")
     return buys, cash
@@ -894,6 +948,7 @@ def run():
         cash      = float(account["cash"])
         profit    = portfolio - 100000
         peak      = update_peak_profit(profit)
+        # Also track if we started negative — peak starts from actual P&L
         report.append(f"🕐 Market {market_msg}")
         report.append(f"💼 Portfolio: ${portfolio:,.2f}")
         report.append(f"💵 Cash:      ${cash:,.2f}")
@@ -914,11 +969,23 @@ def run():
 
     report.append("="*45)
 
-    # Get positions — exclude micros
+    # Get positions — exclude micros from trading logic
+    # AND automatically clean up micro positions
     try:
         positions = get_positions()
-        held      = {p["symbol"]: p for p in positions
-                    if float(p["market_value"]) >= 1.00}
+        held      = {}
+        for p in positions:
+            mval = float(p["market_value"])
+            sym  = p["symbol"]
+            if mval >= 1.00:
+                held[sym] = p
+            else:
+                # Auto-delete micro positions silently
+                try:
+                    alpaca_request("DELETE", f"/v2/positions/{sym}")
+                    print(f"Auto-cleared micro: {sym} (${mval:.4f})")
+                except Exception:
+                    pass
     except Exception as e:
         report.append(f"Positions error: {e}")
         held = {}
