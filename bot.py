@@ -1019,6 +1019,7 @@ def run():
             f"${get_daily_loss():.2f} / ${DAILY_LOSS_LIMIT:.2f}")
         report.append(f"\n{'='*45}")
         report.append(f"✅ Market closed — see you tomorrow!")
+        report.append(f"\n🙏 To God Be All The Glory.")
         report.append(f"{'='*45}")
 
         print("\n".join(report))
