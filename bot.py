@@ -941,6 +941,8 @@ def run():
             return
 
         report = []
+        report.append(f"🙏 TO GOD BE ALL THE GLORY 🙏")
+        report.append(f"{'='*45}")
         report.append(f"🤖 AI Trading Bot — End of Day Report")
         report.append(f"📅 {now_et.strftime('%A %B %d, %Y')}")
         report.append(f"⏰ {now_et.strftime('%I:%M %p')} ET")
@@ -1019,7 +1021,6 @@ def run():
             f"${get_daily_loss():.2f} / ${DAILY_LOSS_LIMIT:.2f}")
         report.append(f"\n{'='*45}")
         report.append(f"✅ Market closed — see you tomorrow!")
-        report.append(f"\n🙏 To God Be All The Glory.")
         report.append(f"{'='*45}")
 
         print("\n".join(report))
