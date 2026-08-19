@@ -25,7 +25,7 @@ FINNHUB_KEY       = os.environ.get("FINNHUB_API_KEY")
 WEEKLY_BUDGET      = 250
 TAKE_PROFIT        = 0.02     # 2% — same as July 1st
 STOP_LOSS          = 0.01     # 1% — same as July 1st, gives room to breathe
-DAILY_LOSS_LIMIT   = 2.00     # $2 — same as July 1st
+DAILY_LOSS_LIMIT   = 5.00     # $5 — appropriate for $250 budget
 MAX_POSITIONS      = 3        # Max 3 stocks per day — focus
 MAX_STOCKS_PER_DAY = 3        # Never trade more than 3 different stocks
 MIN_ORDER          = 1.00
@@ -184,7 +184,7 @@ def get_goal_tracker(current_profit):
     needed_per_day = remaining / max(days_remaining, 1)
     daily_avg      = current_profit / max(cycle_day, 1)
     pct_complete   = min(100, (current_profit / PROFIT_GOAL) * 100)
-    projected_2wk  = daily_avg * GOAL_DAYS
+    projected_30d  = round(daily_avg * 30, 2)
     cycle_num      = ((days_elapsed - 1) // GOAL_DAYS) + 1
     return {
         "total_profit":   round(current_profit, 2),
@@ -194,7 +194,7 @@ def get_goal_tracker(current_profit):
         "days_remaining": days_remaining,
         "needed_per_day": round(needed_per_day, 2),
         "daily_avg":      round(daily_avg, 2),
-        "projected_2wk":  round(projected_2wk, 2),
+        "projected_30d":  projected_30d,
         "on_track":       needed_per_day <= daily_avg,
         "cycle":          f"Cycle {cycle_num}",
     }
@@ -568,7 +568,7 @@ def check_news_catalysts(held, losers, symbols_today, report):
                      if w in a.get("headline", "").lower())
             neg = sum(1 for a in recent for w in neg_words
                      if w in a.get("headline", "").lower())
-            if pos >= 3 and pos > neg:
+            if pos >= 2 and pos > neg:
                 price = get_latest_price(symbol)
                 if price:
                     report.append(
@@ -1011,7 +1011,7 @@ def run():
             report.append(
                 f"   Avg/day:         ${goal['daily_avg']:.2f}")
             report.append(
-                f"   Projected 2wk:   ${goal['projected_2wk']:.2f}")
+                f"   Projected 30d:   ${goal['projected_30d']:.2f}")
             report.append(
                 f"   On track:        "
                 f"{'✅ YES' if goal['on_track'] else '❌ NO'}")
