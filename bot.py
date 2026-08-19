@@ -22,7 +22,7 @@ FINNHUB_KEY       = os.environ.get("FINNHUB_API_KEY")
 # =============================================
 # SETTINGS — PROFESSIONAL DISCIPLINE
 # =============================================
-WEEKLY_BUDGET      = 100
+WEEKLY_BUDGET      = 250
 TAKE_PROFIT        = 0.02     # 2% — same as July 1st
 STOP_LOSS          = 0.01     # 1% — same as July 1st, gives room to breathe
 DAILY_LOSS_LIMIT   = 2.00     # $2 — same as July 1st
@@ -31,8 +31,8 @@ MAX_STOCKS_PER_DAY = 3        # Never trade more than 3 different stocks
 MIN_ORDER          = 1.00
 EARNINGS_SAFE_DAYS = 5
 PROFIT_GOAL        = 50.00
-GOAL_DAYS          = 10
-GOAL_START_DATE    = "2026-07-28"  # Next cycle starts Monday
+GOAL_DAYS          = 30
+GOAL_START_DATE    = "2026-08-19"  # Next cycle starts Monday
 ET                 = ZoneInfo("America/New_York")
 EARLY_CLOSE_DATES  = ["07-03", "07-04", "11-28", "12-24"]
 
